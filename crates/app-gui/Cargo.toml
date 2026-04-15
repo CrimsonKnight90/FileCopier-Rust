@@ -1,0 +1,14 @@
+[package]
+name        = "app-gui"
+version     = "0.1.0"
+edition     = "2021"
+description = "GUI Tauri de FileCopier-Rust (Fase 2 — pendiente de configuración)"
+publish     = false
+
+# Placeholder mínimo válido para que Cargo no se queje si se incluye en el workspace.
+# Este crate se activa en Fase 2 junto con la configuración completa de Tauri.
+[lib]
+name = "app_gui"
+path = "src/lib.rs"
+
+[dependencies]

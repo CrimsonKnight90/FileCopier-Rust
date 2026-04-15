@@ -1,0 +1,28 @@
+[package]
+name        = "app-cli"
+version     = "0.1.0"
+edition     = "2021"
+description = "CLI de FileCopier-Rust: interfaz de línea de comandos para el motor dual de copia"
+
+[[bin]]
+name = "filecopier"
+path = "src/main.rs"
+
+[dependencies]
+lib-core = { path = "../lib-core" }
+lib-os   = { path = "../lib-os"   }
+
+clap               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Windows: SetConsoleCtrlHandler para pausa limpia con Ctrl+C
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Console",   # SetConsoleCtrlHandler, CTRL_C_EVENT, etc.
+    "Win32_Foundation",       # BOOL
+] }
+
+# Unix: handler de señales POSIX (SIGINT)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

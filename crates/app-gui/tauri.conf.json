@@ -1,0 +1,17 @@
+{
+  "build": {
+    "distDir": "../src",
+    "devPath": "../src/index.html"
+  },
+  "package": {
+    "productName": "FileCopier",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "windows": [
+      {
+        "title": "FileCopier"
+      }
+    ]
+  }
+}

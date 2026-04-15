@@ -1,0 +1,54 @@
+[package]
+name        = "lib-core"
+version     = "0.1.0"
+edition     = "2021"
+description = "Motor principal de FileCopier-Rust: pipelines, hashing, checkpointing y telemetría"
+
+[dependencies]
+# Async runtime — usado por el motor de enjambre
+tokio        = { workspace = true }
+
+# Paralelismo CPU-bound — usado por el hasher de bloques grandes
+rayon        = { workspace = true }
+
+# Canales lock-free — pipeline Lector → Escritor
+crossbeam    = { workspace = true }
+
+# Hashers
+blake3       = { workspace = true }
+twox-hash    = { workspace = true }
+sha2         = { workspace = true }
+
+# Serialización de checkpoints
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+
+# Errores ergonómicos
+thiserror    = { workspace = true }
+
+# Logging estructurado
+tracing      = { workspace = true }
+
+# Tiempo (timestamps en checkpoints y telemetría)
+chrono       = { workspace = true }
+
+# Escaneo de directorios para el triage
+walkdir      = { workspace = true }
+
+# Mutex de alto rendimiento para throttling
+parking_lot  = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true }
+blake3   = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[[bench]]
+name = "engine_bench"
+harness = false
+
+[lib]
+name = "lib_core"
+path = "src/lib.rs"

@@ -1,0 +1,25 @@
+[package]
+name        = "lib-os"
+version     = "0.1.0"
+edition     = "2021"
+description = "Abstracciones de sistema operativo para FileCopier-Rust"
+
+[dependencies]
+lib-core  = { path = "../lib-core" }
+tracing   = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",  # GetDriveTypeW, SetFileInformationByHandle, SetFileAttributesW, CreateFileW
+    "Win32_Foundation",          # HANDLE, BOOL, INVALID_HANDLE_VALUE, CloseHandle
+    "Win32_System_IO",           # DeviceIoControl
+    "Win32_Security",            # SECURITY_ATTRIBUTES (requerido por CreateFileW)
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lib]
+name = "lib_os"
+path = "src/lib.rs"

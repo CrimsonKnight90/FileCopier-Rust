@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lib-core",
+    "crates/lib-os",
+    "crates/app-cli",
+    # app-gui se incorpora en Fase 2 (requiere Tauri y frontend configurado)
+    # "crates/app-gui",
+]
+
+# Perfiles optimizados para el proyecto
+[profile.release]
+opt-level     = 3
+lto           = "thin"       # LTO parcial: buen balance compilación/rendimiento
+codegen-units = 1            # Un solo CGU maximiza inlining cross-crate
+strip         = "symbols"    # Reduce tamaño binario en producción
+panic         = "abort"      # Sin unwinding: menor overhead y binario más pequeño
+
+[profile.dev]
+opt-level = 1                # O1 en dev: compilación rápida con algo de optimización
+debug     = true
+
+# Perfil específico para benchmarking: release con debug info
+[profile.bench]
+inherits  = "release"
+debug     = 1                # Permite flamegraphs sin perder optimizaciones
+
+# Dependencias compartidas en todo el workspace (evita duplicados y versiones inconsistentes)
+[workspace.dependencies]
+# Async runtime
+tokio        = { version = "1.38", features = ["full"] }
+
+# Paralelismo CPU-bound
+rayon        = "1.10"
+
+# Canales lock-free de alto rendimiento
+crossbeam    = "0.8"
+
+# Hashers
+blake3       = "1.5"
+twox-hash    = "1.6"
+sha2         = "0.10"
+
+# Utilidades
+walkdir      = "2.5"
+serde        = { version = "1.0", features = ["derive"] }
+serde_json   = "1.0"
+thiserror    = "1.0"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap         = { version = "4.5", features = ["derive", "env"] }
+
+# Tiempo (timestamps en checkpoints y telemetría)
+chrono       = { version = "0.4", features = ["serde"] }
+
+# Testing
+tempfile     = "3.10"
+
+# Benchmarking
+criterion    = { version = "0.5", default-features = false }
+
+# Hashers para benchmarks
+blake3       = "1.5"
+xxhash-rust  = { version = "0.8", features = ["xxh3"] }
+
+# Mutex de alto rendimiento
+parking_lot  = "0.12"
