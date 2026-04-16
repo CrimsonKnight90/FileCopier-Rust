@@ -122,6 +122,8 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
         hash_algorithm:          algorithm,
         resume:                  cli.resume,
         use_partial_files:       !cli.no_partial,
+        bandwidth_limit_bytes_per_sec: 0,
+        bandwidth_burst_bytes:   1 * 1024 * 1024,
     };
 
     // ── 3. Detección de hardware ──────────────────────────────────────────────
@@ -181,7 +183,7 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
 
     // NUEVO: construir OsOps según detección o modo manual
     let os_ops: Arc<dyn lib_core::os_ops::OsOps> = if !cli.no_detect {
-        Arc::new(lib_os::platform_adapter_os_ops())
+        lib_os::platform_adapter_os_ops().into()
     } else {
         Arc::new(lib_core::os_ops::NoOpOsOps)
     };
@@ -299,9 +301,12 @@ fn handle_signal() {
                 // Primera señal: pausar limpiamente
                 eprintln!("\n⏸  Pausa solicitada. Presiona Ctrl+C de nuevo para cancelar.");
                 flow.pause();
-            } else {
-                // Segunda señal: cancelar definitivamente
+            } else if prev == 1 {
+                // Segunda señal: cancelar definitivamente (solo imprimir una vez)
                 eprintln!("\n⚠  Cancelando y guardando checkpoint...");
+                flow.cancel();
+            } else {
+                // Señales adicionales: solo cancelar, no imprimir
                 flow.cancel();
             }
         }
@@ -340,8 +345,11 @@ extern "C" fn unix_sigint_handler(_sig: libc::c_int) {
             if prev == 0 {
                 eprintln!("\n⏸  Pausa solicitada. Presiona Ctrl+C de nuevo para cancelar.");
                 flow.pause();
-            } else {
+            } else if prev == 1 {
                 eprintln!("\n⚠  Cancelando y guardando checkpoint...");
+                flow.cancel();
+            } else {
+                // Señales adicionales: solo cancelar, no imprimir
                 flow.cancel();
             }
         }

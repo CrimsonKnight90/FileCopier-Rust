@@ -50,6 +50,7 @@ impl OsAdapter for UnixAdapter {
 
         let file = OpenOptions::new()
             .write(true)
+            .create(true)
             .open(path)
             .map_err(|e| CoreError::io(path, e))?;
 

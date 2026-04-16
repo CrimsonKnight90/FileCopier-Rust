@@ -4,9 +4,9 @@
 
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
-use windows::core::{COMLibrary, BSTR, GUID, HRESULT};
+
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-use windows::Win32::Foundation::HWND;
+
 
 // Nota: En una implementación completa de producción, aquí se incluirían las interfaces COM completas de IVssBackupComponents, etc.
 // Para este ejemplo, simularemos la lógica crítica y dejaremos los puntos de extensión claros.
@@ -24,6 +24,7 @@ impl VssContext {
         // Inicializar COM en modo multihilo
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
                 .context("Failed to initialize COM library for VSS")?;
         }
         
@@ -83,7 +84,7 @@ impl Drop for VssContext {
 /// Extrae la letra de la unidad de una ruta (ej: "C:\\").
 fn get_drive_letter(path: &Path) -> Result<String> {
     let component = path.components().next()
-        .context("Ruta vacía o inválida")?;
+        .ok_or_else(|| anyhow::anyhow!("Ruta vacía o inválida"))?;
     
     match component {
         std::path::Component::Prefix(prefix) => {
@@ -117,7 +118,7 @@ pub fn read_file_via_vss(file_path: &Path) -> Result<Vec<u8>> {
 
 fn read_file_raw(path: &Path) -> Result<Vec<u8>> {
     use std::fs;
-    fs::read(path).with_context(|| format!("No se pudo leer el archivo en {:?}", path))
+    fs::read(path).map_err(|e| anyhow::anyhow!("No se pudo leer el archivo en {:?}: {}", path, e))
 }
 
 #[cfg(test)]
