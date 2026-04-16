@@ -112,7 +112,8 @@ impl SwarmEngine {
             let config    = Arc::clone(&self.config);
             let telemetry = self.telemetry.clone();
             let flow      = self.flow.clone();
-            let os_ops    = Arc::clone(&self.os_ops);   // ← NUEVO
+            let os_ops    = Arc::clone(&self.os_ops);
+            let throttle  = self.throttle.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = sem
@@ -151,7 +152,7 @@ impl SwarmEngine {
                     &config,
                     &telemetry,
                     os_ops.as_ref(),
-                    self.throttle.as_ref(),
+                    throttle.as_ref(),
                 ).await;
                 (entry.relative, result)
             });

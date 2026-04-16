@@ -1,3 +1,4 @@
+--- .gitignore
 # Dependencies
 target/
 **/target/
@@ -83,3 +84,38 @@ __pycache__/
 *.tar.bz2
 *.tar.xz
 *.tar.zst
+
++++ .gitignore (修改后)
+```
+# Dependencies
+target/
+Cargo.lock
+
+# Compiled and build artifacts
+**/*.rs.bk
+**/*.rlib
+**/*.so
+**/*.dylib
+**/*.dll
+**/*.exe
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+```

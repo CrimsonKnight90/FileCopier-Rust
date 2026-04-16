@@ -8,8 +8,14 @@ description = "Abstracciones de sistema operativo para FileCopier-Rust"
 lib-core  = { path = "../lib-core" }
 tracing   = { workspace = true }
 thiserror = { workspace = true }
+anyhow    = { workspace = true }
+log       = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Com",
+    "Win32_Foundation",
+] }
 windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",  # GetDriveTypeW, SetFileInformationByHandle, SetFileAttributesW, CreateFileW
     "Win32_Foundation",          # HANDLE, BOOL, INVALID_HANDLE_VALUE, CloseHandle
