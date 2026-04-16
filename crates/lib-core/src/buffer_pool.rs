@@ -39,6 +39,12 @@ impl Buffer {
         self.data.len()
     }
 
+    /// Obtiene la capacidad del buffer.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
     /// Verifica si el buffer está vacío.
     #[inline]
     pub fn is_empty(&self) -> bool {
