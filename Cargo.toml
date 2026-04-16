@@ -69,3 +69,6 @@ xxhash-rust  = { version = "0.8", features = ["xxh3"] }
 
 # Mutex de alto rendimiento
 parking_lot  = "0.12"
+
+# Windows API for operations nativas
+windows-sys = { version = "0.58", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

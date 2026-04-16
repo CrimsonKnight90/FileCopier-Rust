@@ -38,6 +38,9 @@ walkdir      = { workspace = true }
 # Mutex de alto rendimiento para throttling
 parking_lot  = { workspace = true }
 
+# Windows API para preallocación nativa
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 tokio    = { workspace = true }
 tempfile = { workspace = true }
