@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use walkdir::WalkDir;
 
-use crate::buffer_pool::BufferPool;
 use crate::checkpoint::{CheckpointState, FlowControl};
 use crate::config::EngineConfig;
 use crate::engine::block::BlockEngine;
@@ -38,18 +37,17 @@ pub struct FileEntry {
 
 pub type ProgressCallback = Box<dyn Fn(CopyProgress) + Send + Sync>;
 
-/// Coordina el escaneo, clasificación y ejecución de la copia.
 pub struct Orchestrator {
     config: Arc<EngineConfig>,
     flow:   FlowControl,
-    os_ops: Arc<dyn OsOps>,               // ← NUEVO
+    os_ops: Arc<dyn OsOps>,
 }
 
 impl Orchestrator {
     pub fn new(
         config: EngineConfig,
         flow:   FlowControl,
-        os_ops: Arc<dyn OsOps>,           // ← NUEVO
+        os_ops: Arc<dyn OsOps>,
     ) -> Self {
         Self {
             config: Arc::new(config),
@@ -66,11 +64,10 @@ impl Orchestrator {
     ) -> Result<CopyResult> {
 
         // ── 1. Escanear origen ────────────────────────────────────────────
-        let all_files = self.scan_files(source_root, dest_root)?;
+        let all_files    = self.scan_files(source_root, dest_root)?;
         let total_bytes: u64 = all_files.iter().map(|f| f.size).sum();
-        let total_files = all_files.len();
 
-        // ── 3. Checkpoint ─────────────────────────────────────────────────
+        // ── 2. Checkpoint ─────────────────────────────────────────────────
         let job_id          = generate_job_id(source_root, dest_root);
         let checkpoint_path = CheckpointState::default_path(dest_root, &job_id);
 
@@ -85,36 +82,52 @@ impl Orchestrator {
             )
         };
 
-        // ── 4. Filtrar completados ────────────────────────────────────────
+        // ── 3. Filtrar completados ────────────────────────────────────────
         let pending: Vec<FileEntry> = all_files
             .into_iter()
             .filter(|f| !checkpoint.completed.contains_key(&f.relative))
             .collect();
 
-        // ── 5. Triage ─────────────────────────────────────────────────────
+        // ── 4. Triage ─────────────────────────────────────────────────────
         let (large_files, small_files): (Vec<FileEntry>, Vec<FileEntry>) =
             pending.into_iter().partition(|f| self.config.is_large_file(f.size));
 
-        // ── 6. Telemetría ─────────────────────────────────────────────────
+        // ── 5. Telemetría ─────────────────────────────────────────────────
         let pending_count = large_files.len() + small_files.len();
-        let telemetry = Arc::new(TelemetrySink::new(total_bytes, pending_count));
+        let telemetry     = Arc::new(TelemetrySink::new(total_bytes, pending_count));
+        let motor_done    = Arc::new(AtomicBool::new(false));
 
-        let motor_done = Arc::new(AtomicBool::new(false));
+        // Reporter de progreso en thread separado (~2 Hz)
+        if let Some(cb) = on_progress {
+            let telemetry_ui = Arc::clone(&telemetry);
+            let done_flag    = Arc::clone(&motor_done);
+            std::thread::Builder::new()
+                .name("progress-reporter".into())
+                .spawn(move || {
+                    while !done_flag.load(Ordering::Relaxed) {
+                        cb(telemetry_ui.snapshot());
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    // Snapshot final
+                    cb(telemetry_ui.snapshot());
+                })
+                .ok();
+        }
 
-        // ── 7. Motor de enjambre ──────────────────────────────────────────
+        // ── 6. Motor de enjambre (archivos pequeños) ──────────────────────
         if !small_files.is_empty() {
             let swarm = SwarmEngine::new(
                 Arc::clone(&self.config),
                 self.flow.clone(),
                 telemetry.handle(),
-                Arc::clone(&self.os_ops),        // ← NUEVO
+                Arc::clone(&self.os_ops),
             );
 
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_io()
                 .build()
-                .expect("No se pudo crear el runtime tokio");
+                .expect("No se pudo crear runtime tokio");
 
             let cp_clone = checkpoint_path.clone();
             let swarm_results = rt.block_on(async {
@@ -124,26 +137,22 @@ impl Orchestrator {
             for (relative, result) in swarm_results {
                 match result {
                     Ok(hash) => checkpoint.mark_completed(relative, hash),
-                    Err(e)  => checkpoint.mark_failed(relative, e.to_string()),
+                    Err(e)   => checkpoint.mark_failed(relative, e.to_string()),
                 }
             }
-
             let _ = checkpoint.save(&checkpoint_path);
         }
 
-        // ── 8. Motor de bloques ───────────────────────────────────────────
-        // Crear buffer pool solo para archivos grandes (optimización zero-alloc)
-        let buffer_pool = Some(BufferPool::new(
-            self.config.block_size_bytes,
-            self.config.channel_capacity * 2, // Doble capacidad para reader + writer
-        ));
-
+        // ── 7. Motor de bloques (archivos grandes) ────────────────────────
+        //
+        // BlockEngine crea su propio BufferPool internamente en copy_file().
+        // Cada archivo grande tiene su propio pool — no hay estado compartido
+        // entre archivos, lo que simplifica el ciclo de vida de los buffers.
         let block_engine = BlockEngine::new(
             Arc::clone(&self.config),
             self.flow.clone(),
             telemetry.handle(),
             Arc::clone(&self.os_ops),
-            buffer_pool,
         );
 
         for entry in large_files {
@@ -154,13 +163,18 @@ impl Orchestrator {
                 continue;
             }
 
-            match block_engine.copy_file(&entry.source, &entry.dest, entry.size) {   // ← NUEVO
+            match block_engine.copy_file(&entry.source, &entry.dest, entry.size) {
                 Ok(hash) => {
                     telemetry.complete_file();
                     checkpoint.mark_completed(entry.relative.clone(), hash);
                 }
                 Err(e) => {
                     telemetry.fail_file();
+                    tracing::error!(
+                        "Error copiando '{}': {}",
+                        entry.source.display(),
+                        e
+                    );
                     checkpoint.mark_failed(entry.relative.clone(), e.to_string());
                 }
             }
@@ -205,7 +219,6 @@ impl Orchestrator {
 fn generate_job_id(source: &Path, dest: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-
     let mut h = DefaultHasher::new();
     source.hash(&mut h);
     dest.hash(&mut h);

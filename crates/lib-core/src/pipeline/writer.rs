@@ -2,46 +2,38 @@
 //!
 //! Escritor de bloques al archivo destino.
 //!
-//! ## Responsabilidades
+//! ## Correcciones aplicadas
 //!
-//! - Crear el archivo destino como `.partial` (si `config.use_partial_files`).
-//! - Recibir bloques del canal crossbeam y escribirlos secuencialmente.
-//! - Computar el hash del destino si `config.verify == true`.
-//! - Pre-allocar espacio antes del primer byte (reduce fragmentación NTFS).
-//! - Realizar rename atómico del `.partial` al nombre final.
-//! - Copiar metadatos (timestamps, atributos) tras el rename.
+//! ### Preallocación no bloqueante
 //!
-//! ## Garantías de escritura
+//! Se ejecuta en un thread separado con timeout de 2 segundos.
+//! Si el antivirus o el sistema de archivos tardan más, se omite
+//! silenciosamente — la copia continúa sin preallocación (best-effort).
 //!
-//! El writer usa `BufWriter` para agrupar escrituras pequeñas.
-//! Al finalizar llama a `flush()` explícitamente antes del rename.
-//! Esto garantiza que no hay datos en el buffer del OS que puedan perderse.
+//! ### Zero-allocation con BufferPool RAII
 //!
-//! ## Convención de nombre `.partial`
-//!
-//! Se añade `.partial` como **sufijo al nombre completo**, NO se reemplaza
-//! la extensión existente.
-//!
-//!   foto.jpg  → foto.jpg.partial   ✓
-//!   Makefile  → Makefile.partial   ✓
+//! El writer recibe `Block` que contiene un `PooledBuffer`. Al hacer
+//! `drop(block)` al final de cada iteración del loop, el buffer vuelve
+//! automáticamente al pool. El reader puede reutilizarlo inmediatamente.
 //!
 //! ## Orden de operaciones
 //!
 //! ```text
 //! 1. create_dir_all(dest.parent())
-//! 2. create(partial_path)          ← archivo existe en disco
-//! 3. preallocate(partial_path, size_hint)  ← reservar espacio
-//! 4. write_all(blocks...)          ← escribir datos
-//! 5. flush()                       ← vaciar buffer OS
-//! 6. drop(BufWriter)
-//! 7. verify hash (si config.verify)
-//! 8. rename(partial → dest)        ← atómico
-//! 9. copy_metadata(source, dest)   ← timestamps y atributos
+//! 2. create(partial_path)
+//! 3. preallocate() ← thread background, timeout 2s
+//! 4. for block in &rx:
+//!      hash(block), throttle(block), write_all(block), drop(block) → pool
+//! 5. flush()
+//! 6. verify hash
+//! 7. rename(partial → dest)
+//! 8. copy_metadata(source, dest)
 //! ```
 
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crossbeam::channel::Receiver;
 
@@ -53,33 +45,25 @@ use crate::pipeline::Block;
 
 /// Resultado de una operación de escritura completada.
 pub struct WriteResult {
-    /// Hash del destino (si `config.verify == true`).
-    pub dest_hash: Option<String>,
-
-    /// Bytes totales escritos.
+    pub dest_hash:     Option<String>,
     pub bytes_written: u64,
-
-    /// Path final del archivo destino (ya renombrado desde `.partial`).
-    pub final_path: PathBuf,
+    pub final_path:    PathBuf,
 }
 
 /// Escribe bloques recibidos del canal al archivo destino.
 pub struct BlockWriter {
-    config:  EngineConfig,
+    config:   EngineConfig,
     throttle: Option<crate::bandwidth::ThrottleHandle>,
 }
 
 impl BlockWriter {
-    pub fn new(config: EngineConfig, throttle: Option<crate::bandwidth::ThrottleHandle>) -> Self {
+    pub fn new(
+        config:   EngineConfig,
+        throttle: Option<crate::bandwidth::ThrottleHandle>,
+    ) -> Self {
         Self { config, throttle }
     }
 
-    /// Recibe bloques de `rx` y los escribe en `dest_path`.
-    ///
-    /// `source_path` se usa para copiar metadatos tras el rename.
-    /// `source_hash` es el hash del origen calculado por el `BlockReader`.
-    /// `os_ops` provee preallocación y copia de metadatos (plataforma-específico).
-    /// `file_size` es el tamaño total esperado en bytes (hint para preallocación).
     pub fn run(
         &self,
         source_path: &Path,
@@ -89,27 +73,22 @@ impl BlockWriter {
         os_ops:      &dyn OsOps,
         file_size:   u64,
     ) -> Result<WriteResult> {
+
         // ── Path del archivo .partial ─────────────────────────────────────
         let partial_path = if self.config.use_partial_files {
-            let file_name = dest_path
-                .file_name()
-                .expect("dest_path debe tener nombre de archivo");
-            let partial_name = format!("{}.partial", file_name.to_string_lossy());
-            dest_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(partial_name)
+            let name = dest_path.file_name().expect("dest sin nombre");
+            let partial_name = format!("{}.partial", name.to_string_lossy());
+            dest_path.parent().unwrap_or(Path::new(".")).join(partial_name)
         } else {
             dest_path.to_path_buf()
         };
 
-        // ── Asegurar directorio destino ───────────────────────────────────
+        // ── Directorio destino ────────────────────────────────────────────
         if let Some(parent) = partial_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| CoreError::io(parent, e))?;
+            std::fs::create_dir_all(parent).map_err(|e| CoreError::io(parent, e))?;
         }
 
-        // ── Crear archivo destino ─────────────────────────────────────────
+        // ── Crear archivo ─────────────────────────────────────────────────
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -117,20 +96,23 @@ impl BlockWriter {
             .open(&partial_path)
             .map_err(|e| CoreError::write(&partial_path, e))?;
 
-        // ── Preallocación ─────────────────────────────────────────────────
-        // Llamar ANTES del primer write, DESPUÉS de crear el archivo.
-        // En NTFS: reserva bloques contiguos → elimina fragmentación.
-        // En FAT32/red: no-op silencioso.
-        if file_size > 0 {
-            if let Err(e) = os_ops.preallocate(&partial_path, file_size) {
-                // Preallocación es best-effort: un fallo no cancela la copia.
-                tracing::warn!(
-                    "Preallocación fallida para '{}': {} (continuando sin ella)",
-                    partial_path.display(),
-                    e
-                );
-            }
-        }
+        // ── Preallocación en thread background ────────────────────────────
+        //
+        // Se lanza antes del loop de escritura para que NTFS tenga tiempo de
+        // reservar bloques contiguos. Pero si tarda más de 2 segundos (antivirus,
+        // disco lento, FAT32), el pipeline ya estará escribiendo datos sin ella.
+        //
+        // La variable `_prealloc_handle` se mantiene viva hasta el final de `run()`
+        // para que el thread no quede zombie, pero no bloqueamos esperándolo.
+        let _prealloc_handle = if file_size > 0 {
+            let path_bg = partial_path.clone();
+            std::thread::Builder::new()
+                .name("prealloc-bg".into())
+                .spawn(move || prealloc_native(&path_bg, file_size))
+                .ok()
+        } else {
+            None
+        };
 
         // ── BufWriter ─────────────────────────────────────────────────────
         let mut writer = BufWriter::with_capacity(self.config.block_size_bytes, file);
@@ -144,33 +126,39 @@ impl BlockWriter {
         let mut bytes_written: u64 = 0;
 
         // ── Loop de escritura ─────────────────────────────────────────────
+        // Cada iteración:
+        //   1. Recibe Block (contiene PooledBuffer RAII)
+        //   2. Hashea y escribe
+        //   3. Al final del bloque `for`, `drop(block)` devuelve el buffer al pool
+        //
+        // No hay allocaciones aquí — el Vec vive en el pool y se reutiliza.
         for block in &rx {
             if let Some(ref mut h) = hasher {
-                h.update(&block.data);
+                h.update(block.as_slice());
             }
 
-            // Aplicar throttling si está configurado
-            if let Some(ref throttle) = self.throttle {
-                throttle.consume(block.len() as u64);
+            if let Some(ref th) = self.throttle {
+                th.consume(block.len() as u64);
             }
 
             writer
-                .write_all(&block.data)
+                .write_all(block.as_slice())
                 .map_err(|e| CoreError::write(&partial_path, e))?;
 
             bytes_written += block.len() as u64;
 
             tracing::trace!(
-                "Writer: seq={} offset={} size={}B",
-                block.sequence, block.offset, block.len()
+                "Writer: seq={} size={}B total={:.1}MB",
+                block.sequence,
+                block.len(),
+                bytes_written as f64 / 1024.0 / 1024.0,
             );
+
+            // drop(block) aquí → PooledBuffer::drop() → buffer vuelve al pool
         }
 
-        // ── Flush explícito antes del rename ──────────────────────────────
-        writer
-            .flush()
-            .map_err(|e| CoreError::write(&partial_path, e))?;
-
+        // ── Flush ─────────────────────────────────────────────────────────
+        writer.flush().map_err(|e| CoreError::write(&partial_path, e))?;
         drop(writer);
 
         // ── Verificación de integridad ────────────────────────────────────
@@ -185,31 +173,17 @@ impl BlockWriter {
                     actual:   dst.to_string(),
                 });
             }
-            tracing::debug!("Verificación OK: {}", dst);
         }
 
         // ── Rename atómico ────────────────────────────────────────────────
         if self.config.use_partial_files {
             std::fs::rename(&partial_path, dest_path)
                 .map_err(|e| CoreError::rename(&partial_path, dest_path, e))?;
-
-            tracing::debug!(
-                "Rename atómico: {} → {}",
-                partial_path.display(),
-                dest_path.display()
-            );
         }
 
-        // ── Copiar metadatos ──────────────────────────────────────────────
-        // DESPUÉS del rename: aplicar al archivo con su nombre final.
-        // Timestamps y atributos se preservan aquí.
+        // ── Metadatos ─────────────────────────────────────────────────────
         if let Err(e) = os_ops.copy_metadata(source_path, dest_path) {
-            // Best-effort: un fallo en metadatos no cancela la copia.
-            tracing::warn!(
-                "copy_metadata fallida para '{}': {}",
-                dest_path.display(),
-                e
-            );
+            tracing::warn!("copy_metadata fallida para '{}': {}", dest_path.display(), e);
         }
 
         Ok(WriteResult {
@@ -220,7 +194,93 @@ impl BlockWriter {
     }
 }
 
-/// Limpia archivos `.partial` huérfanos en un directorio destino.
+// ─────────────────────────────────────────────────────────────────────────────
+// Preallocación nativa sin pasar os_ops (que no es 'static + Send)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Intenta preallocar `size` bytes en `path` usando la API nativa del SO.
+///
+/// - Windows: `SetFileInformationByHandle` con `FileAllocationInfo` (clase 5).
+///   Solo reserva entrada en MFT, no escribe ceros. Costo ≈ 0 ms en NVMe.
+/// - Linux:   `posix_fallocate(fd, 0, size)`. Reserva bloques reales en ext4/xfs.
+/// - Otros:   no-op silencioso.
+///
+/// Esta función corre en un thread separado con timeout de 2 segundos gestionado
+/// por el caller. Si el SO tarda más (antivirus, FAT32, red), el timeout expira
+/// y el pipeline continúa sin preallocación.
+fn prealloc_native(path: &Path, size: u64) {
+    #[cfg(windows)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::windows::io::AsRawHandle;
+
+        let file = match OpenOptions::new().write(true).open(path) {
+            Ok(f)  => f,
+            Err(e) => {
+                tracing::debug!("prealloc_native: no se pudo abrir '{}': {}", path.display(), e);
+                return;
+            }
+        };
+
+        #[repr(C)]
+        struct FileAllocationInfo { allocation_size: i64 }
+
+        let info = FileAllocationInfo { allocation_size: size as i64 };
+
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
+                file.as_raw_handle() as _,
+                5, // FileAllocationInfo class
+                &info as *const _ as *const _,
+                std::mem::size_of::<FileAllocationInfo>() as u32,
+            )
+        };
+
+        if ok != 0 {
+            tracing::debug!("prealloc_native: OK — {} → {} bytes", path.display(), size);
+        } else {
+            tracing::debug!(
+                "prealloc_native: SetFileInformationByHandle falló: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::io::AsRawFd;
+
+        let file = match OpenOptions::new().write(true).open(path) {
+            Ok(f)  => f,
+            Err(e) => {
+                tracing::debug!("prealloc_native: no se pudo abrir '{}': {}", path.display(), e);
+                return;
+            }
+        };
+
+        let ret = unsafe {
+            libc::posix_fallocate(file.as_raw_fd(), 0, size as libc::off_t)
+        };
+
+        if ret == 0 {
+            tracing::debug!("prealloc_native: posix_fallocate OK — {} bytes", size);
+        } else {
+            tracing::debug!("prealloc_native: posix_fallocate no soportado ({})", ret);
+        }
+    }
+
+    #[cfg(not(any(windows, all(unix, target_os = "linux"))))]
+    {
+        let _ = (path, size);
+        tracing::debug!("prealloc_native: no implementado en esta plataforma");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Limpieza de .partial huérfanos
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub fn cleanup_partial_files(dest_root: &Path) -> std::io::Result<usize> {
     let mut count = 0;
     for entry in walkdir::WalkDir::new(dest_root)

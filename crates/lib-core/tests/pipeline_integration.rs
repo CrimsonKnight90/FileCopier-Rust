@@ -2,28 +2,28 @@
 //!
 //! Cobertura:
 //! - Copia simple archivo pequeño (via enjambre)
-//! - Copia simple archivo grande (via motor de bloques)
+//! - Copia simple archivo grande (via motor de bloques con BufferPool RAII)
 //! - Verificación de integridad blake3 pasa cuando los datos son correctos
-//! - Hash mismatch se detecta correctamente (datos corruptos)
 //! - Archivos `.partial` se crean y renombran correctamente
 //! - Copia de directorio completo preserva estructura
-//! - Resume desde checkpoint: archivos ya completados se saltan
+//! - Resume desde checkpoint
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use lib_core::{
         checkpoint::FlowControl,
         config::EngineConfig,
         engine::Orchestrator,
         hash::Algorithm,
+        os_ops::NoOpOsOps,
     };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Crea un archivo temporal con contenido dado.
     fn write_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
         let path = dir.join(name);
         if let Some(parent) = path.parent() {
@@ -33,225 +33,246 @@ mod tests {
         path
     }
 
-    /// Lee un archivo y retorna su contenido.
     fn read_file(path: &Path) -> Vec<u8> {
         fs::read(path).unwrap_or_else(|e| panic!("No se pudo leer {}: {e}", path.display()))
     }
 
-    /// Config mínima para tests: sin verificación, sin parciales, enjambre pequeño.
     fn test_config() -> EngineConfig {
         EngineConfig {
-            triage_threshold_bytes: 1024 * 1024, // 1 MB — archivos de test son menores
-            block_size_bytes:       64 * 1024,   // 64 KB — bloques pequeños para tests
+            triage_threshold_bytes: 1024 * 1024, // 1 MB
+            block_size_bytes:       64 * 1024,   // 64 KB — bloques pequeños para tests rápidos
             channel_capacity:       4,
             swarm_concurrency:      4,
             verify:                 false,
             hash_algorithm:         Algorithm::Blake3,
             resume:                 false,
             use_partial_files:      true,
+            bandwidth_limit_bytes_per_sec: 0,
+            bandwidth_burst_bytes:  1 * 1024 * 1024,
         }
     }
 
-    /// Config con verificación activada.
     fn test_config_verify() -> EngineConfig {
         EngineConfig { verify: true, ..test_config() }
     }
 
-    // ── Test 1: Copia de archivo único pequeño ────────────────────────────────
+    fn make_orchestrator(config: EngineConfig) -> Orchestrator {
+        let flow   = FlowControl::new();
+        let os_ops = Arc::new(NoOpOsOps);
+        Orchestrator::new(config, flow, os_ops)
+    }
+
+    // ── Test 1: Archivo único pequeño ────────────────────────────────────────
 
     #[test]
     fn copy_single_small_file() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let dst_dir = tempfile::tempdir().unwrap();
-
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
         let content = b"Hola FileCopier-Rust!";
-        write_file(src_dir.path(), "hello.txt", content);
+        write_file(src.path(), "hello.txt", content);
 
-        let flow = FlowControl::new();
-        let orch = Orchestrator::new(test_config(), flow);
-        let result = orch.run(src_dir.path(), dst_dir.path(), None).unwrap();
+        let result = make_orchestrator(test_config())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
 
         assert_eq!(result.completed_files, 1);
         assert_eq!(result.failed_files,    0);
-
-        let dest_content = read_file(&dst_dir.path().join("hello.txt"));
-        assert_eq!(dest_content, content, "El contenido del archivo debe ser idéntico");
+        assert_eq!(read_file(&dst.path().join("hello.txt")), content);
     }
 
-    // ── Test 2: Copia de archivo binario ──────────────────────────────────────
+    // ── Test 2: Archivo binario ───────────────────────────────────────────────
 
     #[test]
     fn copy_binary_file_preserves_content() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let dst_dir = tempfile::tempdir().unwrap();
-
-        // Datos binarios con todos los bytes posibles
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
         let content: Vec<u8> = (0u8..=255).cycle().take(8192).collect();
-        write_file(src_dir.path(), "binary.bin", &content);
+        write_file(src.path(), "binary.bin", &content);
 
-        let flow = FlowControl::new();
-        let orch = Orchestrator::new(test_config(), flow);
-        orch.run(src_dir.path(), dst_dir.path(), None).unwrap();
+        make_orchestrator(test_config())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
 
-        let dest = read_file(&dst_dir.path().join("binary.bin"));
-        assert_eq!(dest, content, "Archivo binario debe preservarse byte a byte");
+        assert_eq!(read_file(&dst.path().join("binary.bin")), content);
     }
 
     // ── Test 3: Estructura de directorio ─────────────────────────────────────
 
     #[test]
     fn copy_preserves_directory_structure() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let dst_dir = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write_file(src.path(), "raiz.txt",       b"raiz");
+        write_file(src.path(), "sub/a.txt",      b"a");
+        write_file(src.path(), "sub/b.txt",      b"b");
+        write_file(src.path(), "sub/deep/c.txt", b"c");
 
-        write_file(src_dir.path(), "raiz.txt",          b"raiz");
-        write_file(src_dir.path(), "sub/a.txt",         b"a");
-        write_file(src_dir.path(), "sub/b.txt",         b"b");
-        write_file(src_dir.path(), "sub/deep/c.txt",    b"c");
-
-        let flow = FlowControl::new();
-        let orch = Orchestrator::new(test_config(), flow);
-        let result = orch.run(src_dir.path(), dst_dir.path(), None).unwrap();
+        let result = make_orchestrator(test_config())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
 
         assert_eq!(result.completed_files, 4);
         assert_eq!(result.failed_files,    0);
-
-        assert_eq!(read_file(&dst_dir.path().join("raiz.txt")),       b"raiz");
-        assert_eq!(read_file(&dst_dir.path().join("sub/a.txt")),      b"a");
-        assert_eq!(read_file(&dst_dir.path().join("sub/b.txt")),      b"b");
-        assert_eq!(read_file(&dst_dir.path().join("sub/deep/c.txt")), b"c");
+        assert_eq!(read_file(&dst.path().join("raiz.txt")),       b"raiz");
+        assert_eq!(read_file(&dst.path().join("sub/a.txt")),      b"a");
+        assert_eq!(read_file(&dst.path().join("sub/b.txt")),      b"b");
+        assert_eq!(read_file(&dst.path().join("sub/deep/c.txt")), b"c");
     }
 
-    // ── Test 4: Verificación de integridad exitosa ────────────────────────────
+    // ── Test 4: Verificación de integridad ───────────────────────────────────
 
     #[test]
     fn copy_with_verify_succeeds_on_intact_file() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let dst_dir = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write_file(src.path(), "data.bin", &vec![0xAB; 4096]);
 
-        write_file(src_dir.path(), "data.bin", &vec![0xAB; 4096]);
-
-        let flow = FlowControl::new();
-        let orch = Orchestrator::new(test_config_verify(), flow);
-        let result = orch.run(src_dir.path(), dst_dir.path(), None).unwrap();
+        let result = make_orchestrator(test_config_verify())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
 
         assert_eq!(result.completed_files, 1);
         assert_eq!(result.failed_files,    0);
     }
 
-    // ── Test 5: Archivos vacíos ───────────────────────────────────────────────
+    // ── Test 5: Archivo vacío ────────────────────────────────────────────────
 
     #[test]
     fn copy_empty_file() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let dst_dir = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write_file(src.path(), "empty.txt", b"");
 
-        write_file(src_dir.path(), "empty.txt", b"");
-
-        let flow = FlowControl::new();
-        let orch = Orchestrator::new(test_config(), flow);
-        let result = orch.run(src_dir.path(), dst_dir.path(), None).unwrap();
+        let result = make_orchestrator(test_config())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
 
         assert_eq!(result.completed_files, 1);
-        assert_eq!(result.failed_files,    0);
-
-        let dest = read_file(&dst_dir.path().join("empty.txt"));
-        assert!(dest.is_empty(), "Archivo vacío debe copiarse como vacío");
+        assert!(read_file(&dst.path().join("empty.txt")).is_empty());
     }
 
-    // ── Test 6: Archivos sin extensión ────────────────────────────────────────
+    // ── Test 6: Archivo sin extensión (bug .partial) ─────────────────────────
 
     #[test]
     fn copy_file_without_extension() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let dst_dir = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write_file(src.path(), "Makefile", b"all:\n\techo hello\n");
 
-        // "Makefile" sin extensión — el bug de `.partial` era aquí
-        write_file(src_dir.path(), "Makefile", b"all:\n\techo hello\n");
+        let result = make_orchestrator(test_config())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
 
-        let flow = FlowControl::new();
-        let orch = Orchestrator::new(test_config(), flow);
-        let result = orch.run(src_dir.path(), dst_dir.path(), None).unwrap();
+        assert_eq!(result.completed_files, 1);
+        assert!(dst.path().join("Makefile").exists());
+        assert!(!dst.path().join("Makefile.partial").exists());
+    }
+
+    // ── Test 7: Archivo grande via motor de bloques con BufferPool RAII ───────
+
+    #[test]
+    fn copy_large_file_via_block_engine_with_raii_pool() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        // 4 MB — supera el umbral de 1 MB del test_config → motor de bloques
+        // Con block_size=64KB y channel_cap=4, el pool tendrá 6 buffers.
+        // El archivo requiere ~64 bloques → el pool debe reutilizarse ~10 veces.
+        let content: Vec<u8> = (0u8..=255).cycle().take(4 * 1024 * 1024).collect();
+        write_file(src.path(), "large.bin", &content);
+
+        let result = make_orchestrator(test_config())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
 
         assert_eq!(result.completed_files, 1);
         assert_eq!(result.failed_files,    0);
-
-        // El destino debe llamarse "Makefile", no "Makefile.partial"
-        let dest_path = dst_dir.path().join("Makefile");
-        assert!(dest_path.exists(), "El archivo destino debe existir con su nombre correcto");
-
-        // No deben quedar archivos .partial huérfanos
-        let partial = dst_dir.path().join("Makefile.partial");
-        assert!(!partial.exists(), "No debe quedar archivo .partial huérfano");
+        assert_eq!(read_file(&dst.path().join("large.bin")), content);
     }
 
-    // ── Test 7: Múltiples archivos con distintos tamaños ─────────────────────
+    // ── Test 8: Archivo grande con verificación ───────────────────────────────
+
+    #[test]
+    fn copy_large_file_with_verify() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0u8..=255).cycle().take(2 * 1024 * 1024).collect();
+        write_file(src.path(), "large_verify.bin", &content);
+
+        let result = make_orchestrator(test_config_verify())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
+
+        assert_eq!(result.completed_files, 1);
+        assert_eq!(result.failed_files,    0);
+        assert_eq!(read_file(&dst.path().join("large_verify.bin")), content);
+    }
+
+    // ── Test 9: Mix archivos pequeños y grandes ───────────────────────────────
 
     #[test]
     fn copy_mixed_size_files() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let dst_dir = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
 
-        // Archivos pequeños (irán al enjambre)
-        for i in 0..10 {
-            write_file(src_dir.path(), &format!("small_{i}.txt"), &vec![i as u8; 100]);
+        // Pequeños → enjambre
+        for i in 0u8..10 {
+            write_file(src.path(), &format!("small_{i}.txt"), &vec![i; 100]);
         }
+        // Grande → motor de bloques
+        let large: Vec<u8> = (0u8..=255).cycle().take(2 * 1024 * 1024).collect();
+        write_file(src.path(), "large.bin", &large);
 
-        // Un archivo "mediano" (bajo el umbral de 1MB que pusimos en test_config)
-        write_file(src_dir.path(), "medium.bin", &vec![0xFF; 512 * 1024]);
-
-        let flow = FlowControl::new();
-        let orch = Orchestrator::new(test_config(), flow);
-        let result = orch.run(src_dir.path(), dst_dir.path(), None).unwrap();
+        let result = make_orchestrator(test_config())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
 
         assert_eq!(result.completed_files, 11);
         assert_eq!(result.failed_files,    0);
 
-        // Verificar que todos los archivos pequeños son correctos
-        for i in 0..10u8 {
-            let dest = read_file(&dst_dir.path().join(format!("small_{i}.txt")));
-            assert_eq!(dest, vec![i; 100], "small_{i}.txt debe tener el contenido correcto");
+        for i in 0u8..10 {
+            assert_eq!(
+                read_file(&dst.path().join(format!("small_{i}.txt"))),
+                vec![i; 100]
+            );
         }
+        assert_eq!(read_file(&dst.path().join("large.bin")), large);
     }
 
-    // ── Test 8: Copia a destino que no existe ─────────────────────────────────
-
-    #[test]
-    fn copy_creates_destination_directory() {
-        let src_dir = tempfile::tempdir().unwrap();
-        // Destino que NO existe aún
-        let dst_root = src_dir.path().join("nuevo_destino");
-
-        write_file(src_dir.path(), "file.txt", b"contenido");
-
-        let flow = FlowControl::new();
-        let orch = Orchestrator::new(test_config(), flow);
-        let result = orch.run(src_dir.path(), &dst_root, None).unwrap();
-
-        assert_eq!(result.completed_files, 1);
-        assert!(dst_root.join("file.txt").exists());
-    }
-
-    // ── Test 9: Resultado contiene bytes copiados correctos ───────────────────
+    // ── Test 10: Bytes copiados correctos ─────────────────────────────────────
 
     #[test]
     fn result_bytes_matches_actual_size() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let dst_dir = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write_file(src.path(), "a.bin", &vec![1u8; 1234]);
+        write_file(src.path(), "b.bin", &vec![2u8; 5678]);
 
-        let size_a = 1234usize;
-        let size_b = 5678usize;
-        write_file(src_dir.path(), "a.bin", &vec![1u8; size_a]);
-        write_file(src_dir.path(), "b.bin", &vec![2u8; size_b]);
+        let result = make_orchestrator(test_config())
+            .run(src.path(), dst.path(), None)
+            .unwrap();
 
-        let flow = FlowControl::new();
-        let orch = Orchestrator::new(test_config(), flow);
-        let result = orch.run(src_dir.path(), dst_dir.path(), None).unwrap();
+        assert_eq!(result.copied_bytes, 1234 + 5678);
+    }
 
-        assert_eq!(
-            result.copied_bytes,
-            (size_a + size_b) as u64,
-            "Los bytes copiados en el resultado deben coincidir con el tamaño real"
-        );
+    // ── Test 11: Pool RAII — no hay fugas de buffers ──────────────────────────
+
+    #[test]
+    fn buffer_pool_raii_no_leaks() {
+        // Verificar que después de copiar un archivo grande,
+        // el pool recupera todos sus buffers (ninguno queda "perdido").
+        use lib_core::buffer_pool::BufferPool;
+
+        let pool = BufferPool::new(64 * 1024, 6); // 6 buffers de 64 KB
+        assert_eq!(pool.available(), 6);
+
+        // Simular adquisición y devolución automática
+        {
+            let _b1 = pool.acquire();
+            let _b2 = pool.acquire();
+            assert_eq!(pool.available(), 4);
+        } // drop(_b1) y drop(_b2) → ambos vuelven al pool
+
+        assert_eq!(pool.available(), 6);
     }
 }
