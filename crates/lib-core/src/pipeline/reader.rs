@@ -102,6 +102,10 @@ impl BlockReader {
             // Usar buffer del pool si está disponible, sino aloca uno nuevo
             let mut buf = if let Some(ref pool) = self.buffer_pool {
                 let mut buffer = pool.acquire();
+                // Establecer la longitud al máximo de la capacidad antes de leer
+                // El buffer del pool viene con len=0, necesitamos resize para que
+                // read() tenga dónde escribir los datos
+                buffer.set_len(buffer.capacity());
                 // Leer directamente en el buffer del pool
                 let n = reader
                     .read(buffer.as_mut_slice())
