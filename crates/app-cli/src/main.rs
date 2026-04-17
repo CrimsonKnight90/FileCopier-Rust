@@ -19,7 +19,7 @@
 //! filecopier --watch-clipboard --dest D:\dst
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
