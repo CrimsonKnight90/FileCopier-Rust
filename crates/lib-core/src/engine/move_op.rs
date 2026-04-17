@@ -25,10 +25,7 @@
 //! y añade la fase de eliminación post-copia.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use crate::config::EngineConfig;
-use crate::error::{CoreError, Result};
 use crate::os_ops::OsOps;
 
 /// Resultado de mover un archivo.

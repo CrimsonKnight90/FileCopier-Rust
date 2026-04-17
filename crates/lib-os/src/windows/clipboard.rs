@@ -1,3 +1,4 @@
+//! crates/lib-os/src/windows/clipboard.rs
 //! # clipboard (Windows)
 //!
 //! Interceptación del portapapeles del sistema operativo para archivos.
@@ -44,7 +45,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tipos públicos
@@ -141,7 +142,7 @@ impl ClipboardWatcher {
     pub fn clear_clipboard(&self) -> Result<()> {
         unsafe {
             use windows_sys::Win32::System::DataExchange::{OpenClipboard, EmptyClipboard, CloseClipboard};
-            if OpenClipboard(0) == 0 {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
                 bail!("OpenClipboard falló: {}", std::io::Error::last_os_error());
             }
             EmptyClipboard();
@@ -154,11 +155,9 @@ impl ClipboardWatcher {
     unsafe fn poll_impl(&mut self) -> Result<Option<ClipboardEvent>> {
         use windows_sys::Win32::System::DataExchange::{
             GetClipboardSequenceNumber, OpenClipboard, CloseClipboard,
-            GetClipboardData, IsClipboardFormatAvailable, RegisterClipboardFormatW,
+            IsClipboardFormatAvailable,
         };
-        use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock, GlobalSize};
         use windows_sys::Win32::System::Ole::CF_HDROP;
-        use windows_sys::Win32::Shell::DragQueryFileW;
 
         // ── Verificar si el portapapeles cambió desde la última consulta ──
         let seq = GetClipboardSequenceNumber();
@@ -167,13 +166,13 @@ impl ClipboardWatcher {
         }
 
         // ── Verificar que hay CF_HDROP disponible ─────────────────────────
-        if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+        if IsClipboardFormatAvailable(CF_HDROP as u32) == 0 {
             self.last_sequence = seq;
             return Ok(None);
         }
 
         // ── Abrir portapapeles ─────────────────────────────────────────────
-        if OpenClipboard(0) == 0 {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
             bail!("OpenClipboard falló: {}", std::io::Error::last_os_error());
         }
 
@@ -185,14 +184,14 @@ impl ClipboardWatcher {
 
     /// Lee los datos del portapapeles (debe llamarse con el portapapeles abierto).
     unsafe fn read_clipboard_data(&self) -> Result<Option<ClipboardEvent>> {
-        use windows_sys::Win32::System::DataExchange::{GetClipboardData, RegisterClipboardFormatW};
+        use windows_sys::Win32::System::DataExchange::GetClipboardData;
         use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
         use windows_sys::Win32::System::Ole::CF_HDROP;
-        use windows_sys::Win32::Shell::DragQueryFileW;
+        use windows_sys::Win32::UI::Shell::DragQueryFileW;
 
         // ── Leer CF_HDROP — lista de paths ────────────────────────────────
-        let hdrop_handle = GetClipboardData(CF_HDROP);
-        if hdrop_handle == 0 {
+        let hdrop_handle = GetClipboardData(CF_HDROP as u32);
+        if hdrop_handle.is_null() {
             return Ok(None);
         }
 
@@ -238,22 +237,20 @@ impl ClipboardWatcher {
 
     /// Lee el formato "Preferred DropEffect" para determinar Copy vs Move.
     unsafe fn read_drop_effect(&self) -> Option<ClipboardOperation> {
-        use windows_sys::Win32::System::DataExchange::{
-            GetClipboardData, RegisterClipboardFormatW,
-        };
+        use windows_sys::Win32::System::DataExchange::GetClipboardData;
         use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 
         // Registrar el formato "Preferred DropEffect" (nombre estándar de Shell)
         let format_name: Vec<u16> = "Preferred DropEffect\0"
             .encode_utf16()
             .collect();
-        let format_id = RegisterClipboardFormatW(format_name.as_ptr());
+        let format_id = windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW(format_name.as_ptr());
         if format_id == 0 {
             return None;
         }
 
         let handle = GetClipboardData(format_id);
-        if handle == 0 {
+        if handle.is_null() {
             return None;
         }
 

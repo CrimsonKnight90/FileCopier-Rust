@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use walkdir::WalkDir;
 
-use crate::checkpoint::{CheckpointState, FlowControl, ResumePolicy};
+use crate::checkpoint::{CheckpointState, FlowControl};
 use crate::config::{EngineConfig, OperationMode};
 use crate::engine::block::BlockEngine;
 use crate::engine::dry_run::{DryRunReport, DryRunner};

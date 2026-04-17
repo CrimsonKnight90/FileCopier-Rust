@@ -25,7 +25,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",        # GlobalLock, GlobalUnlock, GlobalSize
     "Win32_System_Ole",           # CF_HDROP, DROPEFFECT_*
     "Win32_System_Console",       # SetConsoleCtrlHandler (para app-cli)
-    "Win32_Shell",                # DragQueryFileW, HDROP
+    "Win32_UI_Shell",             # DragQueryFileW, HDROP
 ] }
 
 [target.'cfg(unix)'.dependencies]
