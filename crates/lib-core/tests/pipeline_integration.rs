@@ -46,6 +46,7 @@ mod tests {
             verify:                 false,
             hash_algorithm:         Algorithm::Blake3,
             resume:                 false,
+            resume_policy:          lib_core::checkpoint::ResumePolicy::VerifySize,
             use_partial_files:      true,
             bandwidth_limit_bytes_per_sec: 0,
             bandwidth_burst_bytes:  1 * 1024 * 1024,
