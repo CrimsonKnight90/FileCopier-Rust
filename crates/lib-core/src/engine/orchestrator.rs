@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use walkdir::WalkDir;
 
-use crate::checkpoint::{CheckpointState, FlowControl};
+use crate::checkpoint::{CheckpointState, FlowControl, ResumePolicy};
 use crate::config::EngineConfig;
 use crate::engine::block::BlockEngine;
 use crate::engine::swarm::SwarmEngine;
@@ -20,11 +20,13 @@ use crate::telemetry::{CopyProgress, TelemetrySink};
 
 #[derive(Debug)]
 pub struct CopyResult {
-    pub completed_files: usize,
-    pub failed_files:    usize,
-    pub total_bytes:     u64,
-    pub copied_bytes:    u64,
-    pub elapsed_secs:    f64,
+    pub completed_files:  usize,
+    pub failed_files:     usize,
+    pub total_bytes:      u64,
+    pub copied_bytes:     u64,
+    pub elapsed_secs:     f64,
+    /// Archivos que fallaron la validación de reanudación y se recopiaron.
+    pub revalidated_files: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +66,7 @@ impl Orchestrator {
     ) -> Result<CopyResult> {
 
         // ── 1. Escanear origen ────────────────────────────────────────────
-        let all_files    = self.scan_files(source_root, dest_root)?;
+        let all_files   = self.scan_files(source_root, dest_root)?;
         let total_bytes: u64 = all_files.iter().map(|f| f.size).sum();
 
         // ── 2. Checkpoint ─────────────────────────────────────────────────
@@ -82,39 +84,64 @@ impl Orchestrator {
             )
         };
 
-        // ── 3. Filtrar completados ────────────────────────────────────────
+        // ── 3. Validación del checkpoint (el fix central) ─────────────────
+        //
+        // Si estamos reanudando, verificar que los archivos marcados como
+        // completados realmente existen en disco y tienen el tamaño correcto.
+        //
+        // validate_completed() mueve de vuelta a `pending` cualquier archivo
+        // que no pase la verificación. El triage del paso 4 los encontrará
+        // en `pending` y los copiará de nuevo.
+        //
+        // Esta llamada es un no-op si:
+        //   - `resume == false` (checkpoint recién creado, completed está vacío)
+        //   - `resume_policy == TrustCheckpoint`
+        let revalidated_files = if self.config.resume {
+            checkpoint.validate_completed(dest_root, self.config.resume_policy)
+        } else {
+            0
+        };
+
+        if revalidated_files > 0 {
+            tracing::warn!(
+                "{} archivos del checkpoint no pasaron la validación y se recopiarán",
+                revalidated_files
+            );
+            // Guardar el checkpoint actualizado (con los archivos revertidos a pending)
+            let _ = checkpoint.save(&checkpoint_path);
+        }
+
+        // ── 4. Filtrar completados válidos ────────────────────────────────
         let pending: Vec<FileEntry> = all_files
             .into_iter()
             .filter(|f| !checkpoint.completed.contains_key(&f.relative))
             .collect();
 
-        // ── 4. Triage ─────────────────────────────────────────────────────
+        // ── 5. Triage ─────────────────────────────────────────────────────
         let (large_files, small_files): (Vec<FileEntry>, Vec<FileEntry>) =
             pending.into_iter().partition(|f| self.config.is_large_file(f.size));
 
-        // ── 5. Telemetría ─────────────────────────────────────────────────
+        // ── 6. Telemetría ─────────────────────────────────────────────────
         let pending_count = large_files.len() + small_files.len();
         let telemetry     = Arc::new(TelemetrySink::new(total_bytes, pending_count));
         let motor_done    = Arc::new(AtomicBool::new(false));
 
-        // Reporter de progreso en thread separado (~2 Hz)
         if let Some(cb) = on_progress {
-            let telemetry_ui = Arc::clone(&telemetry);
-            let done_flag    = Arc::clone(&motor_done);
+            let tel_ui    = Arc::clone(&telemetry);
+            let done_flag = Arc::clone(&motor_done);
             std::thread::Builder::new()
                 .name("progress-reporter".into())
                 .spawn(move || {
                     while !done_flag.load(Ordering::Relaxed) {
-                        cb(telemetry_ui.snapshot());
+                        cb(tel_ui.snapshot());
                         std::thread::sleep(std::time::Duration::from_millis(500));
                     }
-                    // Snapshot final
-                    cb(telemetry_ui.snapshot());
+                    cb(tel_ui.snapshot());
                 })
                 .ok();
         }
 
-        // ── 6. Motor de enjambre (archivos pequeños) ──────────────────────
+        // ── 7. Motor de enjambre ──────────────────────────────────────────
         if !small_files.is_empty() {
             let swarm = SwarmEngine::new(
                 Arc::clone(&self.config),
@@ -135,19 +162,20 @@ impl Orchestrator {
             })?;
 
             for (relative, result) in swarm_results {
+                // Buscar tamaño del archivo para guardarlo en el checkpoint
+                let size = std::fs::metadata(dest_root.join(&relative))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
                 match result {
-                    Ok(hash) => checkpoint.mark_completed(relative, hash),
+                    Ok(hash) => checkpoint.mark_completed(relative, hash, size),
                     Err(e)   => checkpoint.mark_failed(relative, e.to_string()),
                 }
             }
             let _ = checkpoint.save(&checkpoint_path);
         }
 
-        // ── 7. Motor de bloques (archivos grandes) ────────────────────────
-        //
-        // BlockEngine crea su propio BufferPool internamente en copy_file().
-        // Cada archivo grande tiene su propio pool — no hay estado compartido
-        // entre archivos, lo que simplifica el ciclo de vida de los buffers.
+        // ── 8. Motor de bloques ───────────────────────────────────────────
         let block_engine = BlockEngine::new(
             Arc::clone(&self.config),
             self.flow.clone(),
@@ -166,15 +194,15 @@ impl Orchestrator {
             match block_engine.copy_file(&entry.source, &entry.dest, entry.size) {
                 Ok(hash) => {
                     telemetry.complete_file();
-                    checkpoint.mark_completed(entry.relative.clone(), hash);
+                    // Guardar tamaño real del archivo destino tras la copia
+                    let dest_size = std::fs::metadata(&entry.dest)
+                        .map(|m| m.len())
+                        .unwrap_or(entry.size); // fallback al tamaño origen
+                    checkpoint.mark_completed(entry.relative.clone(), hash, dest_size);
                 }
                 Err(e) => {
                     telemetry.fail_file();
-                    tracing::error!(
-                        "Error copiando '{}': {}",
-                        entry.source.display(),
-                        e
-                    );
+                    tracing::error!("Error copiando '{}': {}", entry.source.display(), e);
                     checkpoint.mark_failed(entry.relative.clone(), e.to_string());
                 }
             }
@@ -187,17 +215,17 @@ impl Orchestrator {
         let snapshot = telemetry.snapshot();
 
         Ok(CopyResult {
-            completed_files: snapshot.completed_files,
-            failed_files:    snapshot.failed_files,
-            total_bytes:     snapshot.total_bytes,
-            copied_bytes:    snapshot.copied_bytes,
-            elapsed_secs:    snapshot.elapsed_secs,
+            completed_files:  snapshot.completed_files,
+            failed_files:     snapshot.failed_files,
+            total_bytes:      snapshot.total_bytes,
+            copied_bytes:     snapshot.copied_bytes,
+            elapsed_secs:     snapshot.elapsed_secs,
+            revalidated_files,
         })
     }
 
     fn scan_files(&self, source_root: &Path, dest_root: &Path) -> Result<Vec<FileEntry>> {
         let mut files = Vec::new();
-
         for entry in WalkDir::new(source_root)
             .follow_links(false)
             .into_iter()
@@ -208,10 +236,8 @@ impl Orchestrator {
             let size     = entry.metadata().map(|m| m.len()).unwrap_or(0);
             let relative = source.strip_prefix(source_root).unwrap().to_path_buf();
             let dest     = dest_root.join(&relative);
-
             files.push(FileEntry { source, dest, size, relative });
         }
-
         Ok(files)
     }
 }

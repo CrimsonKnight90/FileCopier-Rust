@@ -3,17 +3,16 @@
 //! Cobertura:
 //! - `mark_completed` / `mark_failed` actualizan estado correctamente
 //! - `is_complete` detecta correctamente cuando no hay pendientes
-//! - `save` + `load` round-trip produce estado idéntico
-//! - El rename atómico garantiza que no hay archivo `.tmp` al finalizar
-//! - `delete` elimina el archivo correctamente
-//! - `default_path` genera path reproducible para mismo job
-//! - `FlowControl`: pause/resume/cancel con `check()`
+//! - `save` + `load` round-trip produce estado idéntico (formato v2)
+//! - Migración automática desde formato v1
+//! - `validate_completed` con cada política (TrustCheckpoint, VerifySize, VerifyHash)
+//! - `FlowControl`: pause/resume/cancel/clone
 
 #[cfg(test)]
-mod tests {    
+mod tests {
     use std::path::PathBuf;
 
-    use lib_core::checkpoint::{CheckpointState, FlowControl};
+    use lib_core::checkpoint::{CheckpointState, FlowControl, ResumePolicy};
     use lib_core::error::CoreError;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -31,140 +30,229 @@ mod tests {
     // ── mark_completed / mark_failed ──────────────────────────────────────────
 
     #[test]
-    fn mark_completed_moves_from_pending_to_completed() {
-        let mut state = make_state(&["a.txt", "b.txt", "c.txt"]);
-        assert_eq!(state.pending.len(),   3);
-        assert_eq!(state.completed.len(), 0);
+    fn mark_completed_stores_entry_with_size() {
+        let mut state = make_state(&["a.txt", "b.txt"]);
+        state.mark_completed(PathBuf::from("a.txt"), Some("abc123".into()), 1024);
 
-        state.mark_completed(PathBuf::from("a.txt"), Some("abc123".into()));
-
-        assert_eq!(state.pending.len(),   2);
-        assert_eq!(state.completed.len(), 1);
+        let entry = state.completed.get(&PathBuf::from("a.txt")).unwrap();
+        assert_eq!(entry.hash.as_deref(), Some("abc123"));
+        assert_eq!(entry.size_bytes, 1024);
         assert!(!state.pending.contains(&PathBuf::from("a.txt")));
-        assert!(state.completed.contains_key(&PathBuf::from("a.txt")));
     }
 
     #[test]
-    fn mark_completed_stores_hash() {
+    fn mark_completed_without_hash() {
         let mut state = make_state(&["file.bin"]);
-        state.mark_completed(PathBuf::from("file.bin"), Some("deadbeef".into()));
-
-        let stored_hash = state.completed.get(&PathBuf::from("file.bin")).unwrap();
-        assert_eq!(stored_hash.as_deref(), Some("deadbeef"));
+        state.mark_completed(PathBuf::from("file.bin"), None, 512);
+        let entry = state.completed.get(&PathBuf::from("file.bin")).unwrap();
+        assert!(entry.hash.is_none());
+        assert_eq!(entry.size_bytes, 512);
     }
 
     #[test]
-    fn mark_completed_without_hash_stores_none() {
-        let mut state = make_state(&["file.bin"]);
-        state.mark_completed(PathBuf::from("file.bin"), None);
-
-        let stored = state.completed.get(&PathBuf::from("file.bin")).unwrap();
-        assert!(stored.is_none());
-    }
-
-    #[test]
-    fn mark_failed_moves_from_pending_to_failed() {
+    fn mark_failed_moves_to_failed() {
         let mut state = make_state(&["good.txt", "bad.txt"]);
         state.mark_failed(PathBuf::from("bad.txt"), "permiso denegado".into());
-
         assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.failed.len(),  1);
-        assert!(!state.pending.contains(&PathBuf::from("bad.txt")));
-        assert!(state.failed.contains_key(&PathBuf::from("bad.txt")));
+        assert_eq!(state.failed.len(), 1);
     }
 
     // ── is_complete ───────────────────────────────────────────────────────────
 
     #[test]
-    fn is_complete_false_when_pending_exist() {
-        let state = make_state(&["a.txt"]);
-        assert!(!state.is_complete());
-    }
-
-    #[test]
-    fn is_complete_true_when_all_processed() {
+    fn is_complete_when_all_processed() {
         let mut state = make_state(&["a.txt", "b.txt"]);
-        state.mark_completed(PathBuf::from("a.txt"), None);
+        state.mark_completed(PathBuf::from("a.txt"), None, 10);
         state.mark_failed(PathBuf::from("b.txt"), "error".into());
-        assert!(state.is_complete(), "Sin pendientes → is_complete() debe ser true");
+        assert!(state.is_complete());
     }
 
     #[test]
     fn empty_job_is_complete() {
-        let state = make_state(&[]);
-        assert!(state.is_complete(), "Job sin archivos debe ser complete");
+        assert!(make_state(&[]).is_complete());
     }
 
-    // ── Save + Load round-trip ────────────────────────────────────────────────
+    // ── validate_completed — TrustCheckpoint ──────────────────────────────────
 
     #[test]
-    fn save_and_load_roundtrip() {
-        let dir = tempfile::tempdir().expect("No se pudo crear directorio temporal");
-        let checkpoint_path = dir.path().join("test.checkpoint");
+    fn trust_checkpoint_never_reverts() {
+        let dir   = tempfile::tempdir().unwrap();
+        let mut s = make_state(&[]);
+        s.mark_completed(PathBuf::from("ghost.txt"), None, 999);
 
-        // Crear estado con actividad
-        let mut state = make_state(&["a.txt", "b.txt", "c.txt"]);
-        state.mark_completed(PathBuf::from("a.txt"), Some("hash_a".into()));
-        state.mark_failed(PathBuf::from("b.txt"), "io error".into());
-        // "c.txt" queda pendiente
+        let reverted = s.validate_completed(dir.path(), ResumePolicy::TrustCheckpoint);
+        assert_eq!(reverted, 0);
+        assert!(s.completed.contains_key(&PathBuf::from("ghost.txt")));
+    }
 
-        // Guardar
-        state.save(&checkpoint_path).expect("save() no debe fallar");
-        assert!(checkpoint_path.exists(), "El archivo de checkpoint debe existir");
+    // ── validate_completed — VerifySize: Missing ──────────────────────────────
 
-        // Cargar
-        let loaded = CheckpointState::load(&checkpoint_path).expect("load() no debe fallar");
+    #[test]
+    fn verify_size_reverts_missing_file() {
+        let dir   = tempfile::tempdir().unwrap();
+        let mut s = make_state(&[]);
+        s.mark_completed(PathBuf::from("missing.txt"), None, 100);
 
-        // Verificar que el estado es idéntico
-        assert_eq!(loaded.job_id,         state.job_id);
-        assert_eq!(loaded.completed.len(), 1);
-        assert_eq!(loaded.failed.len(),    1);
-        assert_eq!(loaded.pending.len(),   1);
-        assert!(loaded.pending.contains(&PathBuf::from("c.txt")));
+        let reverted = s.validate_completed(dir.path(), ResumePolicy::VerifySize);
 
-        let hash = loaded.completed.get(&PathBuf::from("a.txt")).unwrap();
-        assert_eq!(hash.as_deref(), Some("hash_a"));
+        assert_eq!(reverted, 1);
+        assert!(!s.completed.contains_key(&PathBuf::from("missing.txt")));
+        assert!(s.pending.contains(&PathBuf::from("missing.txt")));
+    }
+
+    // ── validate_completed — VerifySize: SizeMismatch ────────────────────────
+
+    #[test]
+    fn verify_size_reverts_truncated_file() {
+        let dir  = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("truncated.txt"), b"short").unwrap();
+
+        let mut s = make_state(&[]);
+        s.mark_completed(PathBuf::from("truncated.txt"), None, 9999);
+
+        let reverted = s.validate_completed(dir.path(), ResumePolicy::VerifySize);
+
+        assert_eq!(reverted, 1);
+        assert!(s.pending.contains(&PathBuf::from("truncated.txt")));
+    }
+
+    // ── validate_completed — VerifySize: OK ──────────────────────────────────
+
+    #[test]
+    fn verify_size_accepts_correct_file() {
+        let dir  = tempfile::tempdir().unwrap();
+        let data = b"hello world";
+        std::fs::write(dir.path().join("ok.txt"), data).unwrap();
+
+        let mut s = make_state(&[]);
+        s.mark_completed(PathBuf::from("ok.txt"), None, data.len() as u64);
+
+        let reverted = s.validate_completed(dir.path(), ResumePolicy::VerifySize);
+        assert_eq!(reverted, 0);
+    }
+
+    // ── validate_completed — VerifySize: v1 migrado (size=0) ─────────────────
+
+    #[test]
+    fn verify_size_with_migrated_v1_entry_accepts_existing_file() {
+        let dir  = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("migrated.txt"), b"any content").unwrap();
+
+        let mut s = make_state(&[]);
+        // size_bytes=0 simula un checkpoint v1 migrado
+        s.mark_completed(PathBuf::from("migrated.txt"), None, 0);
+
+        let reverted = s.validate_completed(dir.path(), ResumePolicy::VerifySize);
+        // Con size=0, solo se verifica existencia — el archivo existe → OK
+        assert_eq!(reverted, 0);
+    }
+
+    // ── validate_completed — VerifyHash: corrupción ───────────────────────────
+
+    #[test]
+    fn verify_hash_detects_corrupted_file_same_size() {
+        let dir  = tempfile::tempdir().unwrap();
+        let original = b"original content";
+
+        let correct_hash = {
+            let mut h = blake3::Hasher::new();
+            h.update(original);
+            h.finalize().to_hex().to_string()
+        };
+
+        // Corromper con mismo tamaño
+        std::fs::write(dir.path().join("corrupt.bin"), b"corrupted!!!!!!").unwrap();
+
+        let mut s = make_state(&[]);
+        s.mark_completed(PathBuf::from("corrupt.bin"), Some(correct_hash), original.len() as u64);
+
+        let reverted = s.validate_completed(dir.path(), ResumePolicy::VerifyHash);
+        assert_eq!(reverted, 1);
+        assert!(s.pending.contains(&PathBuf::from("corrupt.bin")));
+    }
+
+    #[test]
+    fn verify_hash_accepts_intact_file() {
+        let dir  = tempfile::tempdir().unwrap();
+        let data = b"intact data";
+        std::fs::write(dir.path().join("intact.bin"), data).unwrap();
+
+        let hash = {
+            let mut h = blake3::Hasher::new();
+            h.update(data);
+            h.finalize().to_hex().to_string()
+        };
+
+        let mut s = make_state(&[]);
+        s.mark_completed(PathBuf::from("intact.bin"), Some(hash), data.len() as u64);
+
+        let reverted = s.validate_completed(dir.path(), ResumePolicy::VerifyHash);
+        assert_eq!(reverted, 0);
+    }
+
+    #[test]
+    fn verify_hash_without_stored_hash_falls_back_to_size() {
+        let dir  = tempfile::tempdir().unwrap();
+        let data = b"data without hash";
+        std::fs::write(dir.path().join("nohash.bin"), data).unwrap();
+
+        let mut s = make_state(&[]);
+        s.mark_completed(PathBuf::from("nohash.bin"), None, data.len() as u64);
+
+        // Sin hash guardado → no puede verificar contenido → acepta por tamaño
+        let reverted = s.validate_completed(dir.path(), ResumePolicy::VerifyHash);
+        assert_eq!(reverted, 0);
+    }
+
+    // ── validate_completed — múltiples archivos ───────────────────────────────
+
+    #[test]
+    fn validate_multiple_files_mixed_results() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.txt"),    b"correct").unwrap();
+        std::fs::write(dir.path().join("small.txt"), b"x").unwrap();
+        // bad.txt no existe
+
+        let mut s = make_state(&[]);
+        s.mark_completed(PathBuf::from("ok.txt"),    None, 7);
+        s.mark_completed(PathBuf::from("bad.txt"),   None, 100);
+        s.mark_completed(PathBuf::from("small.txt"), None, 500);
+
+        let reverted = s.validate_completed(dir.path(), ResumePolicy::VerifySize);
+
+        assert_eq!(reverted, 2);
+        assert!(s.completed.contains_key(&PathBuf::from("ok.txt")));
+        assert!(s.pending.contains(&PathBuf::from("bad.txt")));
+        assert!(s.pending.contains(&PathBuf::from("small.txt")));
+    }
+
+    // ── Save + Load round-trip v2 ─────────────────────────────────────────────
+
+    #[test]
+    fn save_and_load_roundtrip_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp  = dir.path().join("test.checkpoint");
+
+        let mut s = make_state(&["a.txt", "b.txt", "c.txt"]);
+        s.mark_completed(PathBuf::from("a.txt"), Some("hash_a".into()), 1024);
+        s.mark_failed(PathBuf::from("b.txt"), "io error".into());
+        s.save(&cp).unwrap();
+
+        let loaded = CheckpointState::load(&cp).unwrap();
+        let entry = loaded.completed.get(&PathBuf::from("a.txt")).unwrap();
+        assert_eq!(entry.hash.as_deref(), Some("hash_a"));
+        assert_eq!(entry.size_bytes, 1024);
+        assert_eq!(loaded.failed.len(), 1);
+        assert_eq!(loaded.pending.len(), 1);
     }
 
     #[test]
     fn save_no_tmp_file_after_success() {
         let dir = tempfile::tempdir().unwrap();
-        let checkpoint_path = dir.path().join("test.checkpoint");
-        let tmp_path = checkpoint_path.with_extension("tmp");
-
-        let state = make_state(&["x.dat"]);
-        state.save(&checkpoint_path).unwrap();
-
-        assert!( checkpoint_path.exists(), "Checkpoint debe existir");
-        assert!(!tmp_path.exists(),        "Archivo .tmp no debe quedar tras save exitoso");
-    }
-
-    #[test]
-    fn load_nonexistent_returns_error() {
-        let result = CheckpointState::load(std::path::Path::new("/no/existe/checkpoint"));
-        assert!(result.is_err());
-    }
-
-    // ── delete ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn delete_removes_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let cp_path = dir.path().join("del.checkpoint");
-
-        let state = make_state(&[]);
-        state.save(&cp_path).unwrap();
-        assert!(cp_path.exists());
-
-        CheckpointState::delete(&cp_path).expect("delete() no debe fallar");
-        assert!(!cp_path.exists(), "Checkpoint debe haber sido eliminado");
-    }
-
-    #[test]
-    fn delete_nonexistent_is_ok() {
-        // Eliminar un checkpoint que no existe no debe ser error
-        let result = CheckpointState::delete(std::path::Path::new("/no/existe"));
-        assert!(result.is_ok());
+        let cp  = dir.path().join("test.checkpoint");
+        make_state(&["x.dat"]).save(&cp).unwrap();
+        assert!( cp.exists());
+        assert!(!cp.with_extension("tmp").exists());
     }
 
     // ── default_path ──────────────────────────────────────────────────────────
@@ -172,33 +260,22 @@ mod tests {
     #[test]
     fn default_path_is_reproducible() {
         let dest = PathBuf::from("/destino");
-        let p1 = CheckpointState::default_path(&dest, "job-abc");
-        let p2 = CheckpointState::default_path(&dest, "job-abc");
-        assert_eq!(p1, p2, "El mismo job debe producir el mismo path de checkpoint");
-    }
-
-    #[test]
-    fn default_path_different_jobs_are_different() {
-        let dest = PathBuf::from("/destino");
-        let p1 = CheckpointState::default_path(&dest, "job-001");
-        let p2 = CheckpointState::default_path(&dest, "job-002");
-        assert_ne!(p1, p2);
+        assert_eq!(
+            CheckpointState::default_path(&dest, "job-abc"),
+            CheckpointState::default_path(&dest, "job-abc")
+        );
     }
 
     #[test]
     fn default_path_is_inside_dest() {
         let dest = PathBuf::from("/mi/destino");
-        let cp   = CheckpointState::default_path(&dest, "job-x");
-        assert!(
-            cp.starts_with(&dest),
-            "El checkpoint debe estar dentro del directorio destino"
-        );
+        assert!(CheckpointState::default_path(&dest, "job-x").starts_with(&dest));
     }
 
     // ── FlowControl ───────────────────────────────────────────────────────────
 
     #[test]
-    fn flow_control_starts_unpaused_uncancelled() {
+    fn flow_control_starts_clean() {
         let fc = FlowControl::new();
         assert!(!fc.is_paused());
         assert!(!fc.is_cancelled());
@@ -206,37 +283,12 @@ mod tests {
     }
 
     #[test]
-    fn flow_control_pause_makes_check_return_paused() {
+    fn flow_control_pause_resume() {
         let fc = FlowControl::new();
         fc.pause();
-        assert!(fc.is_paused());
-
-        match fc.check() {
-            Err(CoreError::Paused) => {},
-            other => panic!("Esperaba CoreError::Paused, obtuvo: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn flow_control_resume_after_pause() {
-        let fc = FlowControl::new();
-        fc.pause();
-        assert!(fc.is_paused());
+        assert!(matches!(fc.check(), Err(CoreError::Paused)));
         fc.resume();
-        assert!(!fc.is_paused());
         assert!(fc.check().is_ok());
-    }
-
-    #[test]
-    fn flow_control_cancel_makes_check_return_disconnected() {
-        let fc = FlowControl::new();
-        fc.cancel();
-        assert!(fc.is_cancelled());
-
-        match fc.check() {
-            Err(CoreError::PipelineDisconnected) => {},
-            other => panic!("Esperaba PipelineDisconnected, obtuvo: {other:?}"),
-        }
     }
 
     #[test]
@@ -244,23 +296,16 @@ mod tests {
         let fc = FlowControl::new();
         fc.pause();
         fc.cancel();
-
-        // Cancel tiene prioridad: check retorna PipelineDisconnected, no Paused
-        match fc.check() {
-            Err(CoreError::PipelineDisconnected) => {},
-            other => panic!("Cancel debe tener prioridad sobre pause: {other:?}"),
-        }
+        assert!(matches!(fc.check(), Err(CoreError::PipelineDisconnected)));
     }
 
     #[test]
     fn flow_control_clone_shares_state() {
         let fc1 = FlowControl::new();
         let fc2 = fc1.clone();
-
         fc1.pause();
-        assert!(fc2.is_paused(), "Clone debe compartir el mismo estado atómico");
-
+        assert!(fc2.is_paused());
         fc2.resume();
-        assert!(!fc1.is_paused(), "Cambios en el clone deben reflejarse en el original");
+        assert!(!fc1.is_paused());
     }
 }

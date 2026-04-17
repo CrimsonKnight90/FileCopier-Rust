@@ -11,7 +11,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use lib_core::{
-    checkpoint::FlowControl,
+    checkpoint::{FlowControl, ResumePolicy},
     config::EngineConfig,
     engine::Orchestrator,
     hash::Algorithm,
@@ -30,14 +30,16 @@ use lib_os::traits::DriveKind;
     version,
     about      = "Motor de copia de alto rendimiento con verificación de integridad",
     long_about = None,
-    after_help = "Ejemplos:\n  filecopier C:\\src C:\\dst\n  filecopier --verify --hasher blake3 C:\\src C:\\dst\n  filecopier --resume C:\\src C:\\dst"
+    after_help = "Ejemplos:\n\
+                  filecopier C:\\src C:\\dst\n\
+                  filecopier --verify --hasher blake3 C:\\src C:\\dst\n\
+                  filecopier --resume C:\\src C:\\dst\n\
+                  filecopier --resume --resume-policy verify-hash C:\\src C:\\dst"
 )]
 struct Cli {
-    /// Ruta de origen (archivo o directorio)
     #[arg(value_name = "ORIGEN")]
     source: PathBuf,
 
-    /// Ruta de destino
     #[arg(value_name = "DESTINO")]
     dest: PathBuf,
 
@@ -69,7 +71,21 @@ struct Cli {
     #[arg(long, short = 'r')]
     resume: bool,
 
-    /// Escribir directamente sin archivos .partial intermedios (no recomendado)
+    /// Política de validación al reanudar
+    ///
+    /// trust    - Confiar ciegamente en el checkpoint (no verificar disco)\n\
+    /// size     - Verificar existencia y tamaño (default, 1 syscall por archivo)\n\
+    /// hash     - Verificar existencia, tamaño y hash blake3 del contenido
+    #[arg(
+        long,
+        default_value = "size",
+        value_name    = "POLICY",
+        value_parser  = parse_resume_policy,
+        verbatim_doc_comment,
+    )]
+    resume_policy: ResumePolicy,
+
+    /// Escribir directamente sin archivos .partial intermedios
     #[arg(long, hide = true)]
     no_partial: bool,
 
@@ -84,6 +100,18 @@ struct Cli {
     /// Mostrar solo errores y resumen final
     #[arg(long, short = 'q')]
     quiet: bool,
+}
+
+fn parse_resume_policy(s: &str) -> std::result::Result<ResumePolicy, String> {
+    match s.to_lowercase().as_str() {
+        "trust"      => Ok(ResumePolicy::TrustCheckpoint),
+        "size"       => Ok(ResumePolicy::VerifySize),
+        "hash"       => Ok(ResumePolicy::VerifyHash),
+        other => Err(format!(
+            "Política desconocida: '{}'. Opciones: trust, size, hash",
+            other
+        )),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -101,13 +129,11 @@ fn main() {
 }
 
 fn run(cli: Cli) -> lib_core::error::Result<()> {
-    // ── 1. Validar paths ──────────────────────────────────────────────────────
     if !cli.source.exists() {
         eprintln!("❌ El origen no existe: {}", cli.source.display());
         std::process::exit(2);
     }
 
-    // ── 2. Construir configuración ────────────────────────────────────────────
     let algorithm = Algorithm::from_str(&cli.hasher).unwrap_or_else(|e| {
         eprintln!("⚠  {e}. Usando blake3 por defecto.");
         Algorithm::Blake3
@@ -121,12 +147,12 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
         verify:                  cli.verify,
         hash_algorithm:          algorithm,
         resume:                  cli.resume,
+        resume_policy:           cli.resume_policy,
         use_partial_files:       !cli.no_partial,
         bandwidth_limit_bytes_per_sec: 0,
         bandwidth_burst_bytes:   1 * 1024 * 1024,
     };
 
-    // ── 3. Detección de hardware ──────────────────────────────────────────────
     if !cli.no_detect {
         let adapter  = lib_os::platform_adapter();
         let strategy = adapter.compute_strategy(&cli.source, &cli.dest);
@@ -153,49 +179,33 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
         }
     }
 
-    // ── 4. Validar configuración ──────────────────────────────────────────────
     config.validate()?;
 
     if !cli.quiet {
         print_config_banner(&config, &cli.source, &cli.dest);
     }
 
-    // ── 5. Control de flujo (Ctrl+C) ──────────────────────────────────────────
-    let flow = FlowControl::new();
-
-    // Contador de señales: 1 = pausar, 2+ = cancelar.
-    // Usar AtomicU32 en lugar de AtomicBool permite distinguir el segundo Ctrl+C.
+    let flow         = FlowControl::new();
     let signal_count = Arc::new(AtomicU32::new(0));
-
     install_ctrlc_handler(flow.clone(), Arc::clone(&signal_count));
 
-    // ── 6. Ejecutar motor ─────────────────────────────────────────────────────
     let start = Instant::now();
     let quiet = cli.quiet;
 
-    let on_progress: lib_core::engine::orchestrator::ProgressCallback = Box::new(
-        move |progress: CopyProgress| {
-            if !quiet {
-                print_progress(&progress);
-            }
-        },
-    );
+    let on_progress: lib_core::engine::orchestrator::ProgressCallback =
+        Box::new(move |progress: CopyProgress| {
+            if !quiet { print_progress(&progress); }
+        });
 
-    // NUEVO: construir OsOps según detección o modo manual
     let os_ops: Arc<dyn lib_core::os_ops::OsOps> = if !cli.no_detect {
         lib_os::platform_adapter_os_ops().into()
     } else {
         Arc::new(lib_core::os_ops::NoOpOsOps)
     };
 
-    // NUEVO: pasar os_ops al Orchestrator
     let orchestrator = Orchestrator::new(config, flow, os_ops);
-
-    // Ejecutar
     let result = orchestrator.run(&cli.source, &cli.dest, Some(on_progress))?;
 
-
-    // ── 7. Resumen final ──────────────────────────────────────────────────────
     if !cli.quiet {
         println!();
     }
@@ -210,131 +220,55 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handler de señales — Windows y Unix
+// Handler de señales
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Instala el handler de Ctrl+C para la plataforma actual.
-///
-/// ## Comportamiento
-///
-/// - Primera señal  → pausa limpia: el motor termina el bloque actual y espera.
-/// - Segunda señal  → cancelación: el motor aborta y guarda el checkpoint.
-///
-/// ## Windows
-///
-/// Usa `SetConsoleCtrlHandler` que intercepta:
-/// - `CTRL_C_EVENT`     (Ctrl+C)
-/// - `CTRL_BREAK_EVENT` (Ctrl+Break)
-/// - `CTRL_CLOSE_EVENT` (cerrar la ventana de la consola)
-///
-/// A diferencia del handler Unix anterior, este funciona correctamente
-/// en Windows sin requerir libc y maneja el cierre de ventana.
-///
-/// ## Unix
-///
-/// Usa `signal(SIGINT)` con un static global (mismo enfoque que antes).
 fn install_ctrlc_handler(flow: FlowControl, signal_count: Arc<AtomicU32>) {
-    #[cfg(windows)]
-    {
-        install_ctrlc_handler_windows(flow, signal_count);
-    }
-
-    #[cfg(unix)]
-    {
-        install_ctrlc_handler_unix(flow, signal_count);
-    }
+    #[cfg(windows)]  install_ctrlc_handler_windows(flow, signal_count);
+    #[cfg(unix)]     install_ctrlc_handler_unix(flow, signal_count);
 }
-
-// ── Windows ───────────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
 fn install_ctrlc_handler_windows(flow: FlowControl, signal_count: Arc<AtomicU32>) {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-
-    // Guardar flow y contador en statics globales para que el handler
-    // extern "system" pueda acceder a ellos sin capturar nada.
-    //
-    // Safety: se escriben exactamente una vez antes de instalar el handler.
-    WINDOWS_FLOW
-        .set(flow)
-        .expect("install_ctrlc_handler llamado más de una vez");
-    WINDOWS_SIGNAL_COUNT
-        .set(signal_count)
-        .expect("install_ctrlc_handler llamado más de una vez");
-
-    unsafe {
-        // TRUE = instalar; FALSE = desinstalar.
-        SetConsoleCtrlHandler(Some(windows_ctrl_handler), 1);
-    }
+    WINDOWS_FLOW.set(flow).expect("handler ya instalado");
+    WINDOWS_SIGNAL_COUNT.set(signal_count).expect("handler ya instalado");
+    unsafe { SetConsoleCtrlHandler(Some(windows_ctrl_handler), 1); }
 }
 
-/// Handler de consola para Windows.
-///
-/// # Safety
-/// Invocado por el OS en un thread separado creado por Windows.
-/// Solo operaciones thread-safe están permitidas aquí.
-/// Retornar TRUE indica que el evento fue manejado (no propagar).
-/// Retornar FALSE indica que otros handlers deben procesarlo.
 #[cfg(windows)]
 unsafe extern "system" fn windows_ctrl_handler(ctrl_type: u32) -> i32 {
-    // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1, CTRL_CLOSE_EVENT = 2
-    // Manejamos los tres: todos deben provocar pausa o cancelación limpia.
-    match ctrl_type {
-        0 | 1 | 2 => {
-            handle_signal();
-            // Retornar TRUE para CTRL_CLOSE_EVENT da al proceso tiempo de
-            // guardar el checkpoint antes de que Windows lo termine.
-            // Para CTRL_C y CTRL_BREAK, el motor gestiona la pausa.
-            1 // TRUE
-        }
-        _ => 0, // FALSE: dejar que otros handlers lo procesen
-    }
+    match ctrl_type { 0 | 1 | 2 => { handle_signal_windows(); 1 } _ => 0 }
 }
 
-/// Lógica compartida entre Windows y Unix para procesar la señal.
 #[cfg(windows)]
-fn handle_signal() {
+fn handle_signal_windows() {
     if let Some(count) = WINDOWS_SIGNAL_COUNT.get() {
         let prev = count.fetch_add(1, Ordering::SeqCst);
         if let Some(flow) = WINDOWS_FLOW.get() {
             if prev == 0 {
-                // Primera señal: pausar limpiamente
                 eprintln!("\n⏸  Pausa solicitada. Presiona Ctrl+C de nuevo para cancelar.");
                 flow.pause();
             } else if prev == 1 {
-                // Segunda señal: cancelar definitivamente (solo imprimir una vez)
                 eprintln!("\n⚠  Cancelando y guardando checkpoint...");
                 flow.cancel();
             } else {
-                // Señales adicionales: solo cancelar, no imprimir
                 flow.cancel();
             }
         }
     }
 }
 
-// Statics globales para Windows (necesarios porque el handler es extern "system")
 #[cfg(windows)]
-static WINDOWS_FLOW: std::sync::OnceLock<FlowControl> = std::sync::OnceLock::new();
-
+static WINDOWS_FLOW:         std::sync::OnceLock<FlowControl>        = std::sync::OnceLock::new();
 #[cfg(windows)]
-static WINDOWS_SIGNAL_COUNT: std::sync::OnceLock<Arc<AtomicU32>> =
-    std::sync::OnceLock::new();
-
-// ── Unix ──────────────────────────────────────────────────────────────────────
+static WINDOWS_SIGNAL_COUNT: std::sync::OnceLock<Arc<AtomicU32>>     = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 fn install_ctrlc_handler_unix(flow: FlowControl, signal_count: Arc<AtomicU32>) {
-    UNIX_FLOW
-        .set(flow)
-        .expect("install_ctrlc_handler llamado más de una vez");
-    UNIX_SIGNAL_COUNT
-        .set(signal_count)
-        .expect("install_ctrlc_handler llamado más de una vez");
-
-    unsafe {
-        libc::signal(libc::SIGINT, unix_sigint_handler as libc::sighandler_t);
-    }
+    UNIX_FLOW.set(flow).expect("handler ya instalado");
+    UNIX_SIGNAL_COUNT.set(signal_count).expect("handler ya instalado");
+    unsafe { libc::signal(libc::SIGINT, unix_sigint_handler as libc::sighandler_t); }
 }
 
 #[cfg(unix)]
@@ -349,7 +283,6 @@ extern "C" fn unix_sigint_handler(_sig: libc::c_int) {
                 eprintln!("\n⚠  Cancelando y guardando checkpoint...");
                 flow.cancel();
             } else {
-                // Señales adicionales: solo cancelar, no imprimir
                 flow.cancel();
             }
         }
@@ -357,21 +290,21 @@ extern "C" fn unix_sigint_handler(_sig: libc::c_int) {
 }
 
 #[cfg(unix)]
-static UNIX_FLOW: std::sync::OnceLock<FlowControl> = std::sync::OnceLock::new();
-
+static UNIX_FLOW:         std::sync::OnceLock<FlowControl>    = std::sync::OnceLock::new();
 #[cfg(unix)]
-static UNIX_SIGNAL_COUNT: std::sync::OnceLock<Arc<AtomicU32>> =
-    std::sync::OnceLock::new();
+static UNIX_SIGNAL_COUNT: std::sync::OnceLock<Arc<AtomicU32>> = std::sync::OnceLock::new();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UI helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn print_config_banner(
-    config: &EngineConfig,
-    source: &std::path::Path,
-    dest:   &std::path::Path,
-) {
+fn print_config_banner(config: &EngineConfig, source: &std::path::Path, dest: &std::path::Path) {
+    let policy_label = match config.resume_policy {
+        ResumePolicy::TrustCheckpoint => "trust (sin validación)",
+        ResumePolicy::VerifySize      => "size  (existencia + tamaño)",
+        ResumePolicy::VerifyHash      => "hash  (existencia + tamaño + blake3)",
+    };
+
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  FileCopier-Rust v{}", env!("CARGO_PKG_VERSION"));
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -388,7 +321,14 @@ fn print_config_banner(
             "✗  (usa --verify para activar)".into()
         }
     );
-    println!("  Checkpoint:   {}", if config.resume { "reanudar" } else { "nuevo" });
+    println!(
+        "  Checkpoint:   {}",
+        if config.resume {
+            format!("reanudar [política: {}]", policy_label)
+        } else {
+            "nuevo".into()
+        }
+    );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 }
@@ -416,42 +356,27 @@ fn print_hardware_info(strategy: &lib_os::traits::CopyStrategy, verify: bool) {
 }
 
 fn print_progress(p: &CopyProgress) {
-    let bar_width: usize = 30;
-    let filled = ((p.percent / 100.0) * bar_width as f64) as usize;
+    let bar_width = 30usize;
+    let filled    = ((p.percent / 100.0) * bar_width as f64) as usize;
     let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
 
-    // Mostrar progreso del archivo actual si hay uno en proceso
     if let Some(ref current_file) = p.current_file {
-        // Extraer solo el nombre del archivo (último componente del path)
         let file_name = std::path::Path::new(current_file)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(current_file.as_str());
-        
-        // Barra de progreso interno del archivo (10 caracteres)
-        let inner_bar_width: usize = 10;
-        let inner_filled = ((p.current_file_progress * 100.0 / 100.0) * inner_bar_width as f64) as usize;
-        let inner_bar: String = "█".repeat(inner_filled.min(inner_bar_width)) 
-            + &"░".repeat((inner_bar_width - inner_filled).saturating_sub(1).min(inner_bar_width));
-        
+        let inner = 10usize;
+        let fi    = ((p.current_file_progress) * inner as f64) as usize;
+        let ib: String = "█".repeat(fi.min(inner)) + &"░".repeat(inner.saturating_sub(fi));
         print!(
             "\r  [{bar}] {:.1}%  {}  {}/{}  ETA: {}  |  {}: [{}] {:.0}%",
-            p.percent,
-            p.throughput_human(),
-            p.completed_files,
-            p.total_files,
-            p.eta_human(),
-            file_name,
-            inner_bar,
-            p.current_file_progress * 100.0,
+            p.percent, p.throughput_human(), p.completed_files, p.total_files,
+            p.eta_human(), file_name, ib, p.current_file_progress * 100.0,
         );
     } else {
         print!(
             "\r  [{bar}] {:.1}%  {}  {}/{}  ETA: {}    ",
-            p.percent,
-            p.throughput_human(),
-            p.completed_files,
-            p.total_files,
+            p.percent, p.throughput_human(), p.completed_files, p.total_files,
             p.eta_human(),
         );
     }
@@ -478,6 +403,12 @@ fn print_summary(
     if result.failed_files > 0 {
         println!("  ⚠  Fallidos: {} archivos", result.failed_files);
     }
+    if result.revalidated_files > 0 {
+        println!(
+            "  ↺  Recopiados por validación: {} archivos",
+            result.revalidated_files
+        );
+    }
     println!("  Copiados:     {:.1} MB", mb);
     println!("  Tiempo:       {:.2}s", elapsed.as_secs_f64());
     println!("  Velocidad:    {:.1} MB/s (promedio)", avg_spd);
@@ -491,24 +422,11 @@ fn print_summary(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Logging
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn init_logging(verbosity: u8, quiet: bool) {
     use tracing_subscriber::EnvFilter;
-
-    let level = if quiet {
-        "error"
-    } else {
-        match verbosity {
-            0 => "warn",
-            1 => "info",
-            2 => "debug",
-            _ => "trace",
-        }
+    let level = if quiet { "error" } else {
+        match verbosity { 0 => "warn", 1 => "info", 2 => "debug", _ => "trace" }
     };
-
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
