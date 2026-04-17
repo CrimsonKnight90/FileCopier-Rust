@@ -6,6 +6,36 @@ use crate::checkpoint::ResumePolicy;
 use crate::error::{CoreError, Result};
 use crate::hash::Algorithm;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OperationMode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Modo de operación del motor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OperationMode {
+    /// Copiar archivos — el origen no se toca. (default)
+    #[default]
+    Copy,
+    /// Mover archivos — el origen se borra después de la copia exitosa.
+    ///
+    /// Semántica: copiar → verificar (si `--verify`) → borrar origen.
+    /// El origen nunca se borra si la copia falla.
+    Move,
+}
+
+impl std::fmt::Display for OperationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperationMode::Copy => write!(f, "copy"),
+            OperationMode::Move => write!(f, "move"),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EngineConfig
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Configuración completa del motor de copia.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -32,17 +62,23 @@ pub struct EngineConfig {
     /// Algoritmo de hashing. Default: blake3
     pub hash_algorithm: Algorithm,
 
+    // ── Operación ─────────────────────────────────────────────────────────────
+    /// Modo de operación: Copy (default) o Move.
+    pub operation_mode: OperationMode,
+
+    /// Si `true`, simula la operación sin escribir nada al disco.
+    ///
+    /// Produce un `DryRunReport` con todas las acciones que se ejecutarían,
+    /// problemas detectados (permisos, espacio) y estadísticas.
+    /// Compatible con `OperationMode::Move` — muestra qué se borraría.
+    pub dry_run: bool,
+
     // ── Resiliencia ───────────────────────────────────────────────────────────
     /// Si `true`, intenta reanudar desde checkpoint existente.
     pub resume: bool,
 
     /// Política de validación al reanudar.
-    ///
-    /// Controla qué verificaciones se hacen sobre los archivos marcados
-    /// como completados en el checkpoint antes de saltarlos.
-    ///
-    /// Default: `ResumePolicy::VerifySize` — verifica existencia y tamaño
-    /// con una sola syscall `stat()` por archivo.
+    /// Default: `ResumePolicy::VerifySize`
     pub resume_policy: ResumePolicy,
 
     /// Si `true`, escribe archivos como `.partial` hasta completarse.
@@ -66,6 +102,8 @@ impl Default for EngineConfig {
             swarm_concurrency:              128,
             verify:                         false,
             hash_algorithm:                 Algorithm::Blake3,
+            operation_mode:                 OperationMode::Copy,
+            dry_run:                        false,
             resume:                         false,
             resume_policy:                  ResumePolicy::VerifySize,
             use_partial_files:              true,
@@ -111,6 +149,7 @@ impl EngineConfig {
                 ),
             });
         }
+        // dry_run + move: combinación válida — el dry-run muestra qué se borraría
         Ok(())
     }
 

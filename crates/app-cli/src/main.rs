@@ -1,6 +1,23 @@
 //! # filecopier CLI
 //!
 //! Interfaz de línea de comandos para FileCopier-Rust.
+//!
+//! ## Modos de operación
+//!
+//! ```
+//! # Copiar (default)
+//! filecopier C:\src D:\dst
+//!
+//! # Mover (copiar + borrar origen si exitoso)
+//! filecopier --move C:\src D:\dst
+//!
+//! # Simular sin escribir
+//! filecopier --dry-run C:\src D:\dst
+//! filecopier --dry-run --move C:\src D:\dst   # muestra qué se borraría
+//!
+//! # Daemon: interceptar Ctrl+C / Ctrl+X del Explorer
+//! filecopier --watch-clipboard --dest D:\dst
+//! ```
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -12,7 +29,7 @@ use clap::Parser;
 
 use lib_core::{
     checkpoint::{FlowControl, ResumePolicy},
-    config::EngineConfig,
+    config::{EngineConfig, OperationMode},
     engine::Orchestrator,
     hash::Algorithm,
     telemetry::CopyProgress,
@@ -20,36 +37,68 @@ use lib_core::{
 use lib_os::traits::DriveKind;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Argumentos CLI
+// CLI args
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Motor de copia de alto rendimiento con verificación de integridad
 #[derive(Parser, Debug)]
 #[command(
     name       = "filecopier",
     version,
-    about      = "Motor de copia de alto rendimiento con verificación de integridad",
-    long_about = None,
+    about      = "Motor de copia/movimiento de alto rendimiento",
     after_help = "Ejemplos:\n\
                   filecopier C:\\src C:\\dst\n\
-                  filecopier --verify --hasher blake3 C:\\src C:\\dst\n\
-                  filecopier --resume C:\\src C:\\dst\n\
-                  filecopier --resume --resume-policy verify-hash C:\\src C:\\dst"
+                  filecopier --move C:\\src C:\\dst\n\
+                  filecopier --dry-run --move C:\\src C:\\dst\n\
+                  filecopier --watch-clipboard --dest D:\\Backup"
 )]
 struct Cli {
-    #[arg(value_name = "ORIGEN")]
-    source: PathBuf,
+    /// Ruta de origen (archivo o directorio). Omitir con --watch-clipboard.
+    #[arg(value_name = "ORIGEN", required_unless_present = "watch_clipboard")]
+    source: Option<PathBuf>,
 
-    #[arg(value_name = "DESTINO")]
-    dest: PathBuf,
+    /// Ruta de destino. Omitir con --watch-clipboard (usar --dest en su lugar).
+    #[arg(value_name = "DESTINO", required_unless_present = "watch_clipboard")]
+    dest: Option<PathBuf>,
 
-    /// Habilita verificación de integridad post-copia
+    // ── Operación ──────────────────────────────────────────────────────────
+
+    /// Mover archivos: copiar → verificar → borrar origen.
+    /// El origen nunca se borra si la copia falla.
+    #[arg(long, short = 'm')]
+    r#move: bool,
+
+    /// Simular la operación sin escribir nada al disco.
+    /// Muestra qué se copiaría/movería, problemas de permisos y espacio.
+    #[arg(long)]
+    dry_run: bool,
+
+    // ── Daemon de portapapeles ─────────────────────────────────────────────
+
+    /// [Solo Windows] Monitorear el portapapeles del sistema.
+    /// Detecta Ctrl+C (copiar) y Ctrl+X (mover) sobre archivos en Explorer
+    /// y ejecuta la operación automáticamente usando --dest como destino.
+    #[arg(long)]
+    watch_clipboard: bool,
+
+    /// Directorio destino para el modo --watch-clipboard.
+    #[arg(long, value_name = "DIR")]
+    dest_dir: Option<PathBuf>,
+
+    /// Intervalo de polling del portapapeles en milisegundos. Default: 500
+    #[arg(long, default_value_t = 500, value_name = "MS")]
+    clipboard_interval: u64,
+
+    // ── Verificación ────────────────────────────────────────────────────────
+
+    /// Habilita verificación de integridad post-copia (blake3 por default)
     #[arg(long)]
     verify: bool,
 
     /// Algoritmo de hashing: blake3, xxhash, sha2
     #[arg(long, default_value = "blake3", value_name = "ALGO")]
     hasher: String,
+
+    // ── Rendimiento ─────────────────────────────────────────────────────────
 
     /// Tamaño de bloque en MB para archivos grandes
     #[arg(long, default_value_t = 4, value_name = "MB")]
@@ -67,29 +116,19 @@ struct Cli {
     #[arg(long, default_value_t = 128, value_name = "N")]
     swarm_limit: usize,
 
+    // ── Resiliencia ──────────────────────────────────────────────────────────
+
     /// Reanudar desde checkpoint existente
     #[arg(long, short = 'r')]
     resume: bool,
 
-    /// Política de validación al reanudar
-    ///
-    /// trust    - Confiar ciegamente en el checkpoint (no verificar disco)\n\
-    /// size     - Verificar existencia y tamaño (default, 1 syscall por archivo)\n\
-    /// hash     - Verificar existencia, tamaño y hash blake3 del contenido
-    #[arg(
-        long,
-        default_value = "size",
-        value_name    = "POLICY",
-        value_parser  = parse_resume_policy,
-        verbatim_doc_comment,
-    )]
+    /// Política de validación al reanudar (trust | size | hash)
+    #[arg(long, default_value = "size", value_name = "POLICY", value_parser = parse_resume_policy)]
     resume_policy: ResumePolicy,
 
-    /// Escribir directamente sin archivos .partial intermedios
     #[arg(long, hide = true)]
     no_partial: bool,
 
-    /// Ignorar detección automática de hardware
     #[arg(long)]
     no_detect: bool,
 
@@ -100,17 +139,18 @@ struct Cli {
     /// Mostrar solo errores y resumen final
     #[arg(long, short = 'q')]
     quiet: bool,
+
+    /// Con --dry-run: mostrar lista detallada de todas las acciones
+    #[arg(long)]
+    verbose_dry_run: bool,
 }
 
 fn parse_resume_policy(s: &str) -> std::result::Result<ResumePolicy, String> {
     match s.to_lowercase().as_str() {
-        "trust"      => Ok(ResumePolicy::TrustCheckpoint),
-        "size"       => Ok(ResumePolicy::VerifySize),
-        "hash"       => Ok(ResumePolicy::VerifyHash),
-        other => Err(format!(
-            "Política desconocida: '{}'. Opciones: trust, size, hash",
-            other
-        )),
+        "trust" => Ok(ResumePolicy::TrustCheckpoint),
+        "size"  => Ok(ResumePolicy::VerifySize),
+        "hash"  => Ok(ResumePolicy::VerifyHash),
+        other   => Err(format!("Política desconocida: '{}'. Opciones: trust, size, hash", other)),
     }
 }
 
@@ -122,6 +162,15 @@ fn main() {
     let cli = Cli::parse();
     init_logging(cli.verbosity, cli.quiet);
 
+    // Modo daemon de portapapeles
+    if cli.watch_clipboard {
+        if let Err(e) = run_clipboard_daemon(&cli) {
+            eprintln!("\n❌ Error en daemon de portapapeles: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Err(e) = run(cli) {
         eprintln!("\n❌ Error fatal: {e}");
         std::process::exit(1);
@@ -129,8 +178,11 @@ fn main() {
 }
 
 fn run(cli: Cli) -> lib_core::error::Result<()> {
-    if !cli.source.exists() {
-        eprintln!("❌ El origen no existe: {}", cli.source.display());
+    let source = cli.source.as_ref().expect("ORIGEN requerido");
+    let dest   = cli.dest.as_ref().expect("DESTINO requerido");
+
+    if !cli.dry_run && !source.exists() {
+        eprintln!("❌ El origen no existe: {}", source.display());
         std::process::exit(2);
     }
 
@@ -140,12 +192,14 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
     });
 
     let mut config = EngineConfig {
-        triage_threshold_bytes: cli.threshold  * 1024 * 1024,
+        triage_threshold_bytes: cli.threshold * 1024 * 1024,
         block_size_bytes:        cli.block_size as usize * 1024 * 1024,
         channel_capacity:        cli.channel_cap,
         swarm_concurrency:       cli.swarm_limit,
         verify:                  cli.verify,
         hash_algorithm:          algorithm,
+        operation_mode:          if cli.r#move { OperationMode::Move } else { OperationMode::Copy },
+        dry_run:                 cli.dry_run,
         resume:                  cli.resume,
         resume_policy:           cli.resume_policy,
         use_partial_files:       !cli.no_partial,
@@ -155,13 +209,7 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
 
     if !cli.no_detect {
         let adapter  = lib_os::platform_adapter();
-        let strategy = adapter.compute_strategy(&cli.source, &cli.dest);
-
-        tracing::info!(
-            "Hardware: origen={:?}, destino={:?}",
-            strategy.source_kind,
-            strategy.dest_kind
-        );
+        let strategy = adapter.compute_strategy(source, dest);
 
         if cli.swarm_limit == 128 {
             config.swarm_concurrency = if cli.verify {
@@ -182,7 +230,19 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
     config.validate()?;
 
     if !cli.quiet {
-        print_config_banner(&config, &cli.source, &cli.dest);
+        print_config_banner(&config, source, dest);
+    }
+
+    // Dry-run: no necesita señales ni progreso
+    if cli.dry_run {
+        let flow   = FlowControl::new();
+        let os_ops = Arc::new(lib_core::os_ops::NoOpOsOps);
+        let orch   = Orchestrator::new(config, flow, os_ops);
+        let result = orch.run(source, dest, None)?;
+        if let Some(report) = result.dry_run_report {
+            report.print(cli.verbose_dry_run || cli.verbosity > 0);
+        }
+        return Ok(());
     }
 
     let flow         = FlowControl::new();
@@ -193,9 +253,7 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
     let quiet = cli.quiet;
 
     let on_progress: lib_core::engine::orchestrator::ProgressCallback =
-        Box::new(move |progress: CopyProgress| {
-            if !quiet { print_progress(&progress); }
-        });
+        Box::new(move |p: CopyProgress| { if !quiet { print_progress(&p); } });
 
     let os_ops: Arc<dyn lib_core::os_ops::OsOps> = if !cli.no_detect {
         lib_os::platform_adapter_os_ops().into()
@@ -203,132 +261,218 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
         Arc::new(lib_core::os_ops::NoOpOsOps)
     };
 
-    let orchestrator = Orchestrator::new(config, flow, os_ops);
-    let result = orchestrator.run(&cli.source, &cli.dest, Some(on_progress))?;
+    let result = Orchestrator::new(config, flow, os_ops)
+        .run(source, dest, Some(on_progress))?;
 
-    if !cli.quiet {
-        println!();
-    }
-
+    if !cli.quiet { println!(); }
     print_summary(&result, start.elapsed());
 
-    if result.failed_files > 0 {
-        std::process::exit(3);
+    if result.failed_files > 0 { std::process::exit(3); }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Daemon de portapapeles
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn run_clipboard_daemon(cli: &Cli) -> lib_core::error::Result<()> {
+    #[cfg(not(windows))]
+    {
+        eprintln!("⚠  --watch-clipboard solo está disponible en Windows.");
+        eprintln!("   En Linux/macOS, usar la integración con el gestor de archivos nativo.");
+        std::process::exit(1);
+    }
+
+    #[cfg(windows)]
+    {
+        use lib_os::windows::clipboard::{ClipboardOperation, ClipboardWatcher};
+
+        let dest_dir = match &cli.dest_dir {
+            Some(d) => d.clone(),
+            None => {
+                eprintln!("❌ --watch-clipboard requiere --dest-dir <DIR>");
+                std::process::exit(1);
+            }
+        };
+
+        if !dest_dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+                eprintln!("❌ No se pudo crear el directorio destino '{}': {}", dest_dir.display(), e);
+                std::process::exit(1);
+            }
+        }
+
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("  FileCopier-Rust — Daemon de portapapeles");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("  Destino:   {}", dest_dir.display());
+        println!("  Intervalo: {} ms", cli.clipboard_interval);
+        println!();
+        println!("  Esperando Ctrl+C o Ctrl+X sobre archivos en Explorer...");
+        println!("  (Presiona Ctrl+C en esta ventana para detener el daemon)");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        let verify    = cli.verify;
+        let block_size = cli.block_size;
+        let threshold  = cli.threshold;
+        let is_quiet   = cli.quiet;
+
+        let mut watcher = ClipboardWatcher::new();
+
+        watcher.watch(cli.clipboard_interval, move |event| {
+            let operation_str = match event.operation {
+                ClipboardOperation::Copy => "COPIAR",
+                ClipboardOperation::Move => "MOVER",
+            };
+
+            println!();
+            println!("  ▶ {} {} archivo(s) → {}",
+                operation_str,
+                event.paths.len(),
+                dest_dir.display()
+            );
+
+            for source_path in &event.paths {
+                println!("    {}", source_path.display());
+
+                if !source_path.exists() {
+                    println!("    ⚠  No existe, saltando");
+                    continue;
+                }
+
+                let config = EngineConfig {
+                    triage_threshold_bytes: threshold * 1024 * 1024,
+                    block_size_bytes:        block_size as usize * 1024 * 1024,
+                    channel_capacity:        8,
+                    swarm_concurrency:       128,
+                    verify,
+                    operation_mode: match event.operation {
+                        ClipboardOperation::Copy => OperationMode::Copy,
+                        ClipboardOperation::Move => OperationMode::Move,
+                    },
+                    dry_run: false,
+                    ..EngineConfig::default()
+                };
+
+                let flow   = FlowControl::new();
+                let os_ops: Arc<dyn lib_core::os_ops::OsOps> =
+                    lib_os::platform_adapter_os_ops().into();
+
+                let start = Instant::now();
+                match Orchestrator::new(config, flow, os_ops)
+                    .run(source_path, &dest_dir, None)
+                {
+                    Ok(result) => {
+                        println!(
+                            "    ✓ {} archivo(s), {:.1} MB en {:.1}s",
+                            result.completed_files,
+                            result.copied_bytes as f64 / 1024.0 / 1024.0,
+                            start.elapsed().as_secs_f64(),
+                        );
+                        if result.move_delete_failed > 0 {
+                            println!(
+                                "    ⚠  {} origen(es) no se pudieron borrar",
+                                result.move_delete_failed
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!("    ✗ Error: {}", e);
+                    }
+                }
+            }
+
+            true // continuar el loop
+        });
     }
 
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handler de señales
+// Señales
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn install_ctrlc_handler(flow: FlowControl, signal_count: Arc<AtomicU32>) {
-    #[cfg(windows)]  install_ctrlc_handler_windows(flow, signal_count);
-    #[cfg(unix)]     install_ctrlc_handler_unix(flow, signal_count);
+    #[cfg(windows)]  install_windows(flow, signal_count);
+    #[cfg(unix)]     install_unix(flow, signal_count);
 }
 
 #[cfg(windows)]
-fn install_ctrlc_handler_windows(flow: FlowControl, signal_count: Arc<AtomicU32>) {
+fn install_windows(flow: FlowControl, signal_count: Arc<AtomicU32>) {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-    WINDOWS_FLOW.set(flow).expect("handler ya instalado");
-    WINDOWS_SIGNAL_COUNT.set(signal_count).expect("handler ya instalado");
-    unsafe { SetConsoleCtrlHandler(Some(windows_ctrl_handler), 1); }
+    WINDOWS_FLOW.set(flow).ok();
+    WINDOWS_COUNT.set(signal_count).ok();
+    unsafe { SetConsoleCtrlHandler(Some(win_handler), 1); }
 }
-
 #[cfg(windows)]
-unsafe extern "system" fn windows_ctrl_handler(ctrl_type: u32) -> i32 {
-    match ctrl_type { 0 | 1 | 2 => { handle_signal_windows(); 1 } _ => 0 }
+unsafe extern "system" fn win_handler(t: u32) -> i32 {
+    if matches!(t, 0 | 1 | 2) { handle_win(); 1 } else { 0 }
 }
-
 #[cfg(windows)]
-fn handle_signal_windows() {
-    if let Some(count) = WINDOWS_SIGNAL_COUNT.get() {
-        let prev = count.fetch_add(1, Ordering::SeqCst);
-        if let Some(flow) = WINDOWS_FLOW.get() {
-            if prev == 0 {
-                eprintln!("\n⏸  Pausa solicitada. Presiona Ctrl+C de nuevo para cancelar.");
-                flow.pause();
-            } else if prev == 1 {
-                eprintln!("\n⚠  Cancelando y guardando checkpoint...");
-                flow.cancel();
-            } else {
-                flow.cancel();
-            }
+fn handle_win() {
+    if let Some(c) = WINDOWS_COUNT.get() {
+        let prev = c.fetch_add(1, Ordering::SeqCst);
+        if let Some(f) = WINDOWS_FLOW.get() {
+            if prev == 0 { eprintln!("\n⏸  Pausa. Ctrl+C de nuevo para cancelar."); f.pause(); }
+            else { eprintln!("\n⚠  Cancelando..."); f.cancel(); }
         }
     }
 }
-
-#[cfg(windows)]
-static WINDOWS_FLOW:         std::sync::OnceLock<FlowControl>        = std::sync::OnceLock::new();
-#[cfg(windows)]
-static WINDOWS_SIGNAL_COUNT: std::sync::OnceLock<Arc<AtomicU32>>     = std::sync::OnceLock::new();
+#[cfg(windows)] static WINDOWS_FLOW:  std::sync::OnceLock<FlowControl>    = std::sync::OnceLock::new();
+#[cfg(windows)] static WINDOWS_COUNT: std::sync::OnceLock<Arc<AtomicU32>> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
-fn install_ctrlc_handler_unix(flow: FlowControl, signal_count: Arc<AtomicU32>) {
-    UNIX_FLOW.set(flow).expect("handler ya instalado");
-    UNIX_SIGNAL_COUNT.set(signal_count).expect("handler ya instalado");
-    unsafe { libc::signal(libc::SIGINT, unix_sigint_handler as libc::sighandler_t); }
+fn install_unix(flow: FlowControl, signal_count: Arc<AtomicU32>) {
+    UNIX_FLOW.set(flow).ok();
+    UNIX_COUNT.set(signal_count).ok();
+    unsafe { libc::signal(libc::SIGINT, unix_handler as libc::sighandler_t); }
 }
-
 #[cfg(unix)]
-extern "C" fn unix_sigint_handler(_sig: libc::c_int) {
-    if let Some(count) = UNIX_SIGNAL_COUNT.get() {
-        let prev = count.fetch_add(1, Ordering::SeqCst);
-        if let Some(flow) = UNIX_FLOW.get() {
-            if prev == 0 {
-                eprintln!("\n⏸  Pausa solicitada. Presiona Ctrl+C de nuevo para cancelar.");
-                flow.pause();
-            } else if prev == 1 {
-                eprintln!("\n⚠  Cancelando y guardando checkpoint...");
-                flow.cancel();
-            } else {
-                flow.cancel();
-            }
+extern "C" fn unix_handler(_: libc::c_int) {
+    if let Some(c) = UNIX_COUNT.get() {
+        let prev = c.fetch_add(1, Ordering::SeqCst);
+        if let Some(f) = UNIX_FLOW.get() {
+            if prev == 0 { eprintln!("\n⏸  Pausa."); f.pause(); }
+            else { eprintln!("\n⚠  Cancelando..."); f.cancel(); }
         }
     }
 }
-
-#[cfg(unix)]
-static UNIX_FLOW:         std::sync::OnceLock<FlowControl>    = std::sync::OnceLock::new();
-#[cfg(unix)]
-static UNIX_SIGNAL_COUNT: std::sync::OnceLock<Arc<AtomicU32>> = std::sync::OnceLock::new();
+#[cfg(unix)] static UNIX_FLOW:  std::sync::OnceLock<FlowControl>    = std::sync::OnceLock::new();
+#[cfg(unix)] static UNIX_COUNT: std::sync::OnceLock<Arc<AtomicU32>> = std::sync::OnceLock::new();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UI helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn print_config_banner(config: &EngineConfig, source: &std::path::Path, dest: &std::path::Path) {
-    let policy_label = match config.resume_policy {
-        ResumePolicy::TrustCheckpoint => "trust (sin validación)",
-        ResumePolicy::VerifySize      => "size  (existencia + tamaño)",
-        ResumePolicy::VerifyHash      => "hash  (existencia + tamaño + blake3)",
+fn print_config_banner(config: &EngineConfig, source: &Path, dest: &Path) {
+    let mode_label = match config.operation_mode {
+        OperationMode::Copy => "copiar",
+        OperationMode::Move => "MOVER (borrar origen tras copia exitosa)",
     };
+    let dry_label = if config.dry_run { " [DRY-RUN — sin cambios en disco]" } else { "" };
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  FileCopier-Rust v{}", env!("CARGO_PKG_VERSION"));
+    println!("  FileCopier-Rust v{}{}", env!("CARGO_PKG_VERSION"), dry_label);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  Origen:       {}", source.display());
     println!("  Destino:      {}", dest.display());
+    println!("  Operación:    {}", mode_label);
     println!("  Bloque:       {} MB", config.block_size_bytes / 1024 / 1024);
-    println!("  Umbral:       {} MB", config.triage_threshold_bytes / 1024 / 1024);
     println!("  Enjambre:     {} tareas", config.swarm_concurrency);
     println!(
         "  Verificación: {}",
-        if config.verify {
-            format!("✓ ({})", config.hash_algorithm)
-        } else {
-            "✗  (usa --verify para activar)".into()
-        }
+        if config.verify { format!("✓ ({})", config.hash_algorithm) }
+        else             { "✗  (usa --verify para activar)".into() }
     );
-    println!(
-        "  Checkpoint:   {}",
-        if config.resume {
-            format!("reanudar [política: {}]", policy_label)
-        } else {
-            "nuevo".into()
-        }
-    );
+    if config.resume {
+        let pol = match config.resume_policy {
+            ResumePolicy::TrustCheckpoint => "trust",
+            ResumePolicy::VerifySize      => "size",
+            ResumePolicy::VerifyHash      => "hash",
+        };
+        println!("  Checkpoint:   reanudar [política: {}]", pol);
+    }
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 }
@@ -340,86 +484,55 @@ fn print_hardware_info(strategy: &lib_os::traits::CopyStrategy, verify: bool) {
         DriveKind::Network => "Red",
         DriveKind::Unknown => "Desconocido",
     };
-    let concurrency = if verify {
-        strategy.recommended_swarm_concurrency_verify
-    } else {
-        strategy.recommended_swarm_concurrency
-    };
+    let c = if verify { strategy.recommended_swarm_concurrency_verify }
+            else       { strategy.recommended_swarm_concurrency };
     println!(
-        "  Hardware: {} → {}  |  enjambre={} bloque={}MB{}",
-        label(strategy.source_kind),
-        label(strategy.dest_kind),
-        concurrency,
-        strategy.recommended_block_size / 1024 / 1024,
-        if verify { "  [verify: concurrencia reducida]" } else { "" },
+        "  Hardware: {} → {}  |  enjambre={} bloque={}MB",
+        label(strategy.source_kind), label(strategy.dest_kind),
+        c, strategy.recommended_block_size / 1024 / 1024,
     );
 }
 
 fn print_progress(p: &CopyProgress) {
-    let bar_width = 30usize;
-    let filled    = ((p.percent / 100.0) * bar_width as f64) as usize;
-    let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+    let w = 30usize;
+    let f = ((p.percent / 100.0) * w as f64) as usize;
+    let bar = "█".repeat(f) + &"░".repeat(w - f);
 
-    if let Some(ref current_file) = p.current_file {
-        let file_name = std::path::Path::new(current_file)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(current_file.as_str());
-        let inner = 10usize;
-        let fi    = ((p.current_file_progress) * inner as f64) as usize;
-        let ib: String = "█".repeat(fi.min(inner)) + &"░".repeat(inner.saturating_sub(fi));
-        print!(
-            "\r  [{bar}] {:.1}%  {}  {}/{}  ETA: {}  |  {}: [{}] {:.0}%",
+    if let Some(ref name) = p.current_file {
+        let n = std::path::Path::new(name)
+            .file_name().and_then(|x| x.to_str()).unwrap_or(name);
+        let ib = 10usize;
+        let fi = (p.current_file_progress * ib as f64) as usize;
+        let ibar = "█".repeat(fi.min(ib)) + &"░".repeat(ib.saturating_sub(fi));
+        print!("\r  [{bar}] {:.1}%  {}  {}/{}  ETA:{}  | {}: [{}]{:.0}%",
             p.percent, p.throughput_human(), p.completed_files, p.total_files,
-            p.eta_human(), file_name, ib, p.current_file_progress * 100.0,
-        );
+            p.eta_human(), n, ibar, p.current_file_progress * 100.0);
     } else {
-        print!(
-            "\r  [{bar}] {:.1}%  {}  {}/{}  ETA: {}    ",
-            p.percent, p.throughput_human(), p.completed_files, p.total_files,
-            p.eta_human(),
-        );
+        print!("\r  [{bar}] {:.1}%  {}  {}/{}  ETA:{}    ",
+            p.percent, p.throughput_human(), p.completed_files, p.total_files, p.eta_human());
     }
-
     use std::io::Write;
     let _ = std::io::stdout().flush();
 }
 
-fn print_summary(
-    result:  &lib_core::engine::orchestrator::CopyResult,
-    elapsed: std::time::Duration,
-) {
-    let mb      = result.copied_bytes as f64 / 1024.0 / 1024.0;
-    let avg_spd = if elapsed.as_secs_f64() > 0.0 {
-        mb / elapsed.as_secs_f64()
-    } else {
-        0.0
-    };
+fn print_summary(result: &lib_core::engine::orchestrator::CopyResult, elapsed: std::time::Duration) {
+    let mb  = result.copied_bytes as f64 / 1024.0 / 1024.0;
+    let spd = if elapsed.as_secs_f64() > 0.0 { mb / elapsed.as_secs_f64() } else { 0.0 };
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  Resumen de copia");
+    println!("  Resumen");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  Completados:  {} archivos", result.completed_files);
-    if result.failed_files > 0 {
-        println!("  ⚠  Fallidos: {} archivos", result.failed_files);
-    }
-    if result.revalidated_files > 0 {
-        println!(
-            "  ↺  Recopiados por validación: {} archivos",
-            result.revalidated_files
-        );
-    }
-    println!("  Copiados:     {:.1} MB", mb);
+    if result.failed_files         > 0 { println!("  ⚠  Fallidos:           {}", result.failed_files); }
+    if result.revalidated_files    > 0 { println!("  ↺  Revalidados:        {}", result.revalidated_files); }
+    if result.moved_files          > 0 { println!("  ✂  Movidos:            {}", result.moved_files); }
+    if result.move_delete_failed   > 0 { println!("  ⚠  Origen no borrado:  {}", result.move_delete_failed); }
+    println!("  Datos:        {:.1} MB", mb);
     println!("  Tiempo:       {:.2}s", elapsed.as_secs_f64());
-    println!("  Velocidad:    {:.1} MB/s (promedio)", avg_spd);
+    println!("  Velocidad:    {:.1} MB/s", spd);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    if result.failed_files == 0 {
-        println!("  ✓ Copia completada exitosamente");
-    } else {
-        println!("  ⚠  Copia completada con {} error(es)", result.failed_files);
-        println!("    Revisa el checkpoint para detalles.");
-    }
+    if result.failed_files == 0 { println!("  ✓ Completado exitosamente"); }
+    else { println!("  ⚠  Completado con {} error(es)", result.failed_files); }
 }
 
 fn init_logging(verbosity: u8, quiet: bool) {
@@ -428,12 +541,6 @@ fn init_logging(verbosity: u8, quiet: bool) {
         match verbosity { 0 => "warn", 1 => "info", 2 => "debug", _ => "trace" }
     };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(level)),
-        )
-        .with_target(false)
-        .with_thread_ids(false)
-        .compact()
-        .init();
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)))
+        .with_target(false).with_thread_ids(false).compact().init();
 }

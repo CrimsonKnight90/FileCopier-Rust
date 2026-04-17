@@ -1,14 +1,9 @@
 //! # windows
 //!
-//! Implementación de `OsAdapter` para Windows usando WinAPI (windows-sys).
-//!
-//! ## Módulos
-//!
-//! - `fs`  → `WindowsAdapter`: preallocate + copy_metadata.
-//! - `vss` → Volume Shadow Copy (Fase 3, vacío por ahora).
+//! Implementación de `OsAdapter` para Windows.
 
 pub mod fs;
 pub mod vss;
+pub mod clipboard;
 
-// Re-exportar el adapter como el tipo público de este módulo
 pub use fs::WindowsAdapter;
