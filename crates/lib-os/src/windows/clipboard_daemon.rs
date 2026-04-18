@@ -147,16 +147,13 @@ pub fn run_daemon(config: DaemonConfig) -> Result<()> {
 }
 
 unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
-    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        CreateWindowExW, DispatchMessageW,
         GetMessageW, PostQuitMessage, RegisterClassExW, TranslateMessage,
         HWND_MESSAGE, MSG, WNDCLASSEXW,
-        WM_DESTROY, WM_CLIPBOARDUPDATE,
     };
     use windows_sys::Win32::System::DataExchange::AddClipboardFormatListener;
-    use windows_sys::Win32::UI::Shell::DragQueryFileW;
 
     // Inicializar COM para este thread (STA — necesario para IShellBrowser)
     use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -288,7 +285,7 @@ unsafe extern "system" fn daemon_wndproc(
 /// Llamada cada vez que el portapapeles cambia (WM_CLIPBOARDUPDATE).
 fn on_clipboard_update() {
     let has_hdrop = clipboard_has_hdrop();
-    let seq       = get_clipboard_sequence();
+    let _seq      = get_clipboard_sequence();
 
     let state_arc = match DAEMON_STATE.get() {
         Some(s) => s,
@@ -497,10 +494,11 @@ fn read_clipboard_files_and_op() -> Option<PendingItem> {
 unsafe fn read_clipboard_impl() -> Option<PendingItem> {
     use windows_sys::Win32::System::DataExchange::{
         GetClipboardData, OpenClipboard, CloseClipboard,
-        GetClipboardSequenceNumber, RegisterClipboardFormatW,
+        GetClipboardSequenceNumber,
     };
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows_sys::Win32::System::Ole::CF_HDROP;
+    use windows_sys::Win32::UI::Shell::DragQueryFileW;
 
     if OpenClipboard(std::ptr::null_mut()) == 0 { return None; }
 
