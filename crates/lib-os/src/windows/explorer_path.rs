@@ -25,7 +25,6 @@
 //! Por eso `get_active_explorer_path()` inicializa COM si es necesario.
 
 use std::path::PathBuf;
-use windows_sys::Win32::Foundation::HWND as SYS_HWND;
 
 /// Intenta obtener la ruta de la carpeta activa en el Explorer foreground.
 ///
@@ -71,17 +70,15 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
         CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
     };
     use windows::core::{Interface, VARIANT};
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     // Inicializar COM en modo STA para este thread
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-    let foreground = GetForegroundWindow();
+    let foreground = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+
     if foreground.is_null() {
         return None;
     }
-    let foreground_hwnd = foreground.0 as SYS_HWND;
 
     // Crear instancia de ShellWindows (colección de ventanas Explorer)
     let shell_windows: IShellWindows = CoCreateInstance(
@@ -103,9 +100,9 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
 
         // Obtener HWND de esta ventana Explorer
         let hwnd_val = browser_app.HWND().ok()?;
-        let hwnd = hwnd_val.0 as SYS_HWND;
+        let hwnd = hwnd_val.0 as isize;
 
-        if hwnd != foreground_hwnd {
+        if hwnd != foreground.0 as isize {
             continue; // No es la ventana activa
         }
 
@@ -160,18 +157,16 @@ unsafe fn try_ui_automation_impl() -> Option<PathBuf> {
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
     use windows::core::{Interface, BSTR, VARIANT};
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-    let foreground_hwnd = GetForegroundWindow();
+    let foreground_hwnd = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
     if foreground_hwnd.is_null() {
         return None;
     }
 
     // Verificar que es una ventana Explorer
-    if !is_explorer_window(foreground_hwnd.0 as SYS_HWND) {
+    if !is_explorer_window(foreground_hwnd) {
         return None;
     }
 
@@ -183,7 +178,7 @@ unsafe fn try_ui_automation_impl() -> Option<PathBuf> {
 
     // Obtener elemento raíz de la ventana foreground
     let root: IUIAutomationElement = automation
-        .ElementFromHandle(HWND(foreground_hwnd as _))
+        .ElementFromHandle(foreground_hwnd)
         .ok()?;
 
     // Crear condición: ControlType == Edit
@@ -205,7 +200,7 @@ unsafe fn try_ui_automation_impl() -> Option<PathBuf> {
 
         // Leer el Name para identificar la barra de dirección
         let name_val = elem.GetCurrentPropertyValue(UIA_NamePropertyId).ok()?;
-        let name_str: String = name_val.to_string();
+        let name_str: String = name_val.to_string().unwrap_or_default();
 
         if !name_str.contains("Address") && !name_str.contains("Dirección") {
             continue;
@@ -285,7 +280,7 @@ fn try_window_title() -> Option<PathBuf> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Verifica si una ventana es una ventana de Explorer (CabinetWClass o ExploreWClass).
-pub fn is_explorer_window(hwnd: SYS_HWND) -> bool {
+pub fn is_explorer_window(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     unsafe {
         use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
         let mut buf = [0u16; 256];

@@ -25,6 +25,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Accessibility",
     # ShellWindows (colección de ventanas Explorer)
     "Win32_System_Ole",
+    # WindowsAndMessaging (GetForegroundWindow, etc.)
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # Crate `windows-sys` para APIs procedurales (más ligero para WndProc, mensajes, etc.)
