@@ -15,6 +15,7 @@ lib-os   = { path = "../lib-os"   }
 clap               = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # Windows: SetConsoleCtrlHandler para pausa limpia con Ctrl+C
 [target.'cfg(windows)'.dependencies]

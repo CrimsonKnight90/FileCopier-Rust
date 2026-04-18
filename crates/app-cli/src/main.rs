@@ -1,3 +1,4 @@
+//! crates/app-cli/src/main.rs
 //! # filecopier CLI
 
 use std::path::PathBuf;
@@ -59,7 +60,8 @@ struct Cli {
     watch_clipboard: bool,
 
     /// Directorio destino fijo para el daemon.
-    /// Si se omite, el daemon pregunta al usuario con un diálogo en cada operación.
+    /// Si se omite, el daemon usa una carpeta temporal por defecto (%TEMP%\FileCopier)
+    /// y NO muestra ventanas emergentes, permitiendo automatización completa.
     #[arg(long, value_name = "DIR")]
     dest_dir: Option<PathBuf>,
 
@@ -212,26 +214,28 @@ fn run_clipboard_daemon(cli: &Cli) -> lib_core::error::Result<()> {
 
 #[cfg(windows)]
 fn run_clipboard_daemon_windows(cli: &Cli) -> lib_core::error::Result<()> {
-    use lib_os::windows::clipboard::{ClipboardOperation, ClipboardWatcher, prompt_folder_dialog};
+    use lib_os::windows::clipboard::{ClipboardOperation, ClipboardWatcher};
 
-    let fixed_dest = cli.dest_dir.clone();
-
-    // Validar/crear el destino fijo si se proporcionó
-    if let Some(ref d) = fixed_dest {
-        if !d.exists() {
-            std::fs::create_dir_all(d).map_err(|e| {
-                lib_core::error::CoreError::io(d, e)
-            })?;
+    // Si no se proporciona --dest-dir, usar %TEMP%\FileCopier como destino por defecto
+    let fixed_dest = cli.dest_dir.clone().unwrap_or_else(|| {
+        let temp_dir = std::env::temp_dir().join("FileCopier");
+        if !temp_dir.exists() {
+            let _ = std::fs::create_dir_all(&temp_dir);
         }
+        temp_dir
+    });
+
+    // Validar/crear el destino fijo
+    if !fixed_dest.exists() {
+        std::fs::create_dir_all(&fixed_dest).map_err(|e| {
+            lib_core::error::CoreError::io(&fixed_dest, e)
+        })?;
     }
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  FileCopier-Rust — Daemon de portapapeles");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    match &fixed_dest {
-        Some(d) => println!("  Destino fijo: {}", d.display()),
-        None    => println!("  Destino:      [se preguntará en cada operación]"),
-    }
+    println!("  Destino:      {}", fixed_dest.display());
     println!("  Intervalo:    {} ms", cli.clipboard_interval);
     println!();
     println!("  Selecciona archivos en Explorer y presiona:");
@@ -264,27 +268,8 @@ fn run_clipboard_daemon_windows(cli: &Cli) -> lib_core::error::Result<()> {
         cli.clipboard_interval,
         &runtime,
         // dest_resolver: retorna el directorio destino para cada evento
-        |_event| {
-            match &fixed_dest {
-                // Destino fijo: usarlo siempre
-                Some(d) => Some(d.clone()),
-                // Sin destino fijo: mostrar diálogo de selección de carpeta
-                None => {
-                    println!();
-                    println!("  Selecciona la carpeta de destino...");
-                    match prompt_folder_dialog("Selecciona carpeta de destino — FileCopier") {
-                        Some(d) => {
-                            println!("  Destino: {}", d.display());
-                            Some(d)
-                        }
-                        None => {
-                            println!("  ⚠  Operación cancelada (no se seleccionó carpeta)");
-                            None
-                        }
-                    }
-                }
-            }
-        },
+        // Ahora siempre retorna fixed_dest (no hay diálogo)
+        |_event| Some(fixed_dest.clone()),
         // on_event: ejecuta la operación
         move |event, dest_dir, rt| {
             // Asegurar que el directorio destino existe

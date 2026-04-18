@@ -1,3 +1,4 @@
+//! crates/lib-os/src/windows/clipboard.rs
 //! # clipboard (Windows)
 //!
 //! Interceptación del portapapeles del sistema operativo para archivos.
@@ -30,7 +31,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tipos públicos
@@ -137,7 +138,7 @@ impl ClipboardWatcher {
             use windows_sys::Win32::System::DataExchange::{
                 CloseClipboard, EmptyClipboard, OpenClipboard,
             };
-            if OpenClipboard(0) == 0 {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
                 bail!("OpenClipboard falló: {}", std::io::Error::last_os_error());
             }
             EmptyClipboard();
@@ -158,17 +159,16 @@ impl ClipboardWatcher {
             return Ok(None);
         }
 
-        if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+        if IsClipboardFormatAvailable(CF_HDROP.into()) == 0 {
             self.last_sequence = seq;
             return Ok(None);
         }
 
-        if OpenClipboard(0) == 0 {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
             bail!("OpenClipboard falló: {}", std::io::Error::last_os_error());
         }
 
         let result = self.read_clipboard_data();
-        use windows_sys::Win32::System::DataExchange::CloseClipboard;
         CloseClipboard();
         self.last_sequence = seq;
         result
@@ -178,10 +178,10 @@ impl ClipboardWatcher {
         use windows_sys::Win32::System::DataExchange::GetClipboardData;
         use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
         use windows_sys::Win32::System::Ole::CF_HDROP;
-        use windows_sys::Win32::Shell::DragQueryFileW;
+        use windows_sys::Win32::UI::Shell::DragQueryFileW;
 
-        let hdrop_handle = GetClipboardData(CF_HDROP);
-        if hdrop_handle == 0 {
+        let hdrop_handle = GetClipboardData(CF_HDROP.into());
+        if hdrop_handle.is_null() {
             return Ok(None);
         }
 
@@ -223,7 +223,7 @@ impl ClipboardWatcher {
         if fmt == 0 { return None; }
 
         let handle = GetClipboardData(fmt);
-        if handle == 0 { return None; }
+        if handle.is_null() { return None; }
 
         let ptr = GlobalLock(handle as _) as *const u32;
         if ptr.is_null() { return None; }

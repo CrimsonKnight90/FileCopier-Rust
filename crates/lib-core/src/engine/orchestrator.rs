@@ -290,6 +290,16 @@ impl Orchestrator {
 
         motor_done.store(true, Ordering::Release);
 
+        // ── Gestión de checkpoint tras cancelación ─────────────────────────
+        //
+        // FIX: Si la operación fue cancelada y NO se usó --resume, eliminar
+        // el checkpoint para que la siguiente ejecución empiece limpia.
+        // Esto evita que operaciones canceladas se reanuden automáticamente.
+        if any_cancelled && !self.config.resume {
+            let _ = CheckpointState::delete(&checkpoint_path);
+            tracing::info!("Checkpoint eliminado tras cancelación: {}", checkpoint_path.display());
+        }
+
         // ── Limpiar directorios vacíos tras Move ──────────────────────────
         //
         // FIX: después de mover todos los archivos, los directorios del origen
