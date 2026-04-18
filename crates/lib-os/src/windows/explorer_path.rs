@@ -102,7 +102,7 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
         let hwnd_val = browser_app.HWND().ok()?;
         let hwnd = hwnd_val.0 as isize;
 
-        if hwnd != foreground.0 as isize {
+        if hwnd != foreground as isize {
             continue; // No es la ventana activa
         }
 
@@ -178,7 +178,7 @@ unsafe fn try_ui_automation_impl() -> Option<PathBuf> {
 
     // Obtener elemento raíz de la ventana foreground
     let root: IUIAutomationElement = automation
-        .ElementFromHandle(foreground_hwnd)
+        .ElementFromHandle(windows::Win32::Foundation::HWND(foreground_hwnd))
         .ok()?;
 
     // Crear condición: ControlType == Edit
@@ -200,7 +200,7 @@ unsafe fn try_ui_automation_impl() -> Option<PathBuf> {
 
         // Leer el Name para identificar la barra de dirección
         let name_val = elem.GetCurrentPropertyValue(UIA_NamePropertyId).ok()?;
-        let name_str: String = name_val.to_string().unwrap_or_default();
+        let name_str: String = name_val.to_string();
 
         if !name_str.contains("Address") && !name_str.contains("Dirección") {
             continue;
