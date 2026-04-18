@@ -49,6 +49,10 @@ pub struct FileEntry {
 
 pub type ProgressCallback = Box<dyn Fn(CopyProgress) + Send + Sync>;
 
+fn num_worker_threads() -> usize {
+    num_cpus::get().max(4)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Orchestrator
 // ─────────────────────────────────────────────────────────────────────────────
@@ -178,7 +182,7 @@ impl Orchestrator {
                 );
 
                 let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
+                    .worker_threads(num_worker_threads())
                     .enable_io()
                     .build()
                     .expect("No se pudo crear runtime tokio");

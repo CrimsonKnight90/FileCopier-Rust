@@ -8,6 +8,9 @@ description = "Motor principal de FileCopier-Rust: pipelines, hashing, checkpoin
 # Async runtime — usado por el motor de enjambre
 tokio        = { workspace = true }
 
+# Detección de CPUs para configuración dinámica del runtime
+num_cpus     = "1.16"
+
 # Paralelismo CPU-bound — usado por el hasher de bloques grandes
 rayon        = { workspace = true }
 
