@@ -1,6 +1,22 @@
 //! # orchestrator
 //!
 //! Punto de entrada del motor. Soporta Copy, Move y Dry-run.
+//!
+//! ## Fix: dest incorrecto cuando source es un archivo individual
+//!
+//! Cuando `source_root` es un archivo (no un directorio), `strip_prefix` produce
+//! un `relative` vacío, y `dest_root.join("")` == `dest_root` mismo.
+//! El writer entonces construye `dest_root.partial` en lugar de
+//! `dest_root/filename.partial`.
+//!
+//! Solución: si `source_root` es un archivo, `dest` se construye como
+//! `dest_root / source_root.file_name()` en lugar de `dest_root / relative`.
+//!
+//! ## Fix: directorios vacíos tras --move
+//!
+//! Después de mover todos los archivos de un árbol, los directorios del origen
+//! quedan vacíos. Se llama a `remove_empty_dirs_after_move(source_root)` al final
+//! de la fase de bloques, solo si la operación es Move y no fue cancelada.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,11 +24,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use walkdir::WalkDir;
 
-use crate::checkpoint::{CheckpointState, FlowControl};
+use crate::checkpoint::{CheckpointState, FlowControl, ResumePolicy};
 use crate::config::{EngineConfig, OperationMode};
 use crate::engine::block::BlockEngine;
 use crate::engine::dry_run::{DryRunReport, DryRunner};
-use crate::engine::move_op::{delete_source_after_copy, same_filesystem, try_atomic_move};
+use crate::engine::move_op::{
+    delete_source_after_copy, remove_empty_dirs_after_move,
+    same_filesystem, try_atomic_move,
+};
 use crate::engine::swarm::SwarmEngine;
 use crate::error::Result;
 use crate::os_ops::OsOps;
@@ -24,19 +43,17 @@ use crate::telemetry::{CopyProgress, TelemetrySink};
 
 #[derive(Debug)]
 pub struct CopyResult {
-    pub completed_files:   usize,
-    pub failed_files:      usize,
-    pub total_bytes:       u64,
-    pub copied_bytes:      u64,
-    pub elapsed_secs:      f64,
-    /// Archivos revertidos en validación de checkpoint y recopiados.
-    pub revalidated_files: usize,
-    /// Archivos movidos exitosamente (modo Move).
-    pub moved_files:       usize,
-    /// Archivos cuyo origen no pudo borrarse después de la copia (modo Move).
+    pub completed_files:    usize,
+    pub failed_files:       usize,
+    pub total_bytes:        u64,
+    pub copied_bytes:       u64,
+    pub elapsed_secs:       f64,
+    pub revalidated_files:  usize,
+    pub moved_files:        usize,
     pub move_delete_failed: usize,
-    /// `Some(report)` si se ejecutó en modo dry-run.
-    pub dry_run_report:    Option<DryRunReport>,
+    /// Directorios vacíos eliminados del origen (modo Move).
+    pub dirs_removed:       usize,
+    pub dry_run_report:     Option<DryRunReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,10 +65,6 @@ pub struct FileEntry {
 }
 
 pub type ProgressCallback = Box<dyn Fn(CopyProgress) + Send + Sync>;
-
-fn num_worker_threads() -> usize {
-    num_cpus::get().max(4)
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Orchestrator
@@ -75,7 +88,7 @@ impl Orchestrator {
         on_progress: Option<ProgressCallback>,
     ) -> Result<CopyResult> {
 
-        // ── Dry-run: analizar sin ejecutar ────────────────────────────────
+        // ── Dry-run ───────────────────────────────────────────────────────
         if self.config.dry_run {
             return self.run_dry(source_root, dest_root);
         }
@@ -105,7 +118,6 @@ impl Orchestrator {
         } else {
             0
         };
-
         if revalidated_files > 0 {
             let _ = checkpoint.save(&checkpoint_path);
         }
@@ -126,35 +138,35 @@ impl Orchestrator {
         let motor_done    = Arc::new(AtomicBool::new(false));
 
         if let Some(cb) = on_progress {
-            let tel_ui    = Arc::clone(&telemetry);
-            let done_flag = Arc::clone(&motor_done);
+            let tel   = Arc::clone(&telemetry);
+            let done  = Arc::clone(&motor_done);
             std::thread::Builder::new()
                 .name("progress-reporter".into())
                 .spawn(move || {
-                    while !done_flag.load(Ordering::Relaxed) {
-                        cb(tel_ui.snapshot());
+                    while !done.load(Ordering::Relaxed) {
+                        cb(tel.snapshot());
                         std::thread::sleep(std::time::Duration::from_millis(500));
                     }
-                    cb(tel_ui.snapshot());
+                    cb(tel.snapshot());
                 })
                 .ok();
         }
 
+        let is_move = self.config.operation_mode == OperationMode::Move;
         let mut moved_files        = 0usize;
         let mut move_delete_failed = 0usize;
-        let is_move = self.config.operation_mode == OperationMode::Move;
+        let mut any_cancelled      = false;
 
         // ── Motor de enjambre (archivos pequeños) ─────────────────────────
         if !small_files.is_empty() {
-            // En modo Move, intentar rename atómico primero para archivos en
-            // el mismo filesystem (O(1), sin I/O de datos)
+            // En modo Move, intentar rename atómico para archivos en mismo filesystem
             let (to_rename, to_copy): (Vec<FileEntry>, Vec<FileEntry>) = if is_move {
-                small_files.into_iter().partition(|f| same_filesystem(&f.source, &f.dest))
+                small_files.into_iter()
+                    .partition(|f| same_filesystem(&f.source, &f.dest))
             } else {
                 (vec![], small_files)
             };
 
-            // Rename atómico para archivos en mismo filesystem
             for entry in to_rename {
                 match try_atomic_move(&entry.source, &entry.dest) {
                     Some(result) => {
@@ -165,14 +177,12 @@ impl Orchestrator {
                         checkpoint.mark_completed(entry.relative, None, size);
                     }
                     None => {
-                        // Fallback a copy+delete
                         telemetry.fail_file();
                         checkpoint.mark_failed(entry.relative, "rename atómico falló".into());
                     }
                 }
             }
 
-            // Copia normal (enjambre) para archivos cross-device o modo Copy
             if !to_copy.is_empty() {
                 let swarm = SwarmEngine::new(
                     Arc::clone(&self.config),
@@ -182,40 +192,30 @@ impl Orchestrator {
                 );
 
                 let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(num_worker_threads())
+                    .worker_threads(2)
                     .enable_io()
                     .build()
                     .expect("No se pudo crear runtime tokio");
 
-                let cp_clone = checkpoint_path.clone();
+                let cp_clone     = checkpoint_path.clone();
                 let swarm_results = rt.block_on(async {
                     swarm.run(to_copy, &cp_clone).await
                 })?;
 
                 for (relative, result) in swarm_results {
-                    let size = std::fs::metadata(dest_root.join(&relative))
-                        .map(|m| m.len())
-                        .unwrap_or(0);
+                    let dest_path = dest_root.join(&relative);
+                    let size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
 
                     match result {
                         Ok(hash) => {
-                            // Modo Move: borrar origen después de copia exitosa
                             if is_move {
                                 let source = source_root.join(&relative);
-                                let dest   = dest_root.join(&relative);
                                 let mr = delete_source_after_copy(
-                                    &source, &dest, hash.clone(), size, self.os_ops.as_ref()
+                                    &source, &dest_path,
+                                    hash.clone(), size, self.os_ops.as_ref(),
                                 );
-                                if mr.delete_failed {
-                                    move_delete_failed += 1;
-                                    tracing::warn!(
-                                        "Move: no se pudo borrar origen '{}': {}",
-                                        source.display(),
-                                        mr.delete_error.unwrap_or_default()
-                                    );
-                                } else {
-                                    moved_files += 1;
-                                }
+                                if mr.delete_failed { move_delete_failed += 1; }
+                                else                { moved_files += 1; }
                             }
                             checkpoint.mark_completed(relative, hash, size);
                         }
@@ -237,13 +237,14 @@ impl Orchestrator {
 
         for entry in large_files {
             if self.flow.is_cancelled() {
+                any_cancelled = true;
                 telemetry.fail_file();
                 checkpoint.mark_failed(entry.relative.clone(), "Cancelado".into());
                 let _ = checkpoint.save(&checkpoint_path);
                 continue;
             }
 
-            // Modo Move mismo filesystem: rename atómico O(1)
+            // Rename atómico para archivos grandes en mismo filesystem
             if is_move && same_filesystem(&entry.source, &entry.dest) {
                 match try_atomic_move(&entry.source, &entry.dest) {
                     Some(result) => {
@@ -255,7 +256,7 @@ impl Orchestrator {
                         let _ = checkpoint.save(&checkpoint_path);
                         continue;
                     }
-                    None => { /* fallback a copy+delete */ }
+                    None => {} // fallback copy+delete
                 }
             }
 
@@ -266,17 +267,13 @@ impl Orchestrator {
                         .map(|m| m.len())
                         .unwrap_or(entry.size);
 
-                    // Modo Move: borrar origen
                     if is_move {
                         let mr = delete_source_after_copy(
                             &entry.source, &entry.dest,
-                            hash.clone(), dest_size, self.os_ops.as_ref()
+                            hash.clone(), dest_size, self.os_ops.as_ref(),
                         );
-                        if mr.delete_failed {
-                            move_delete_failed += 1;
-                        } else {
-                            moved_files += 1;
-                        }
+                        if mr.delete_failed { move_delete_failed += 1; }
+                        else                { moved_files += 1; }
                     }
 
                     checkpoint.mark_completed(entry.relative.clone(), hash, dest_size);
@@ -292,24 +289,36 @@ impl Orchestrator {
         }
 
         motor_done.store(true, Ordering::Release);
+
+        // ── Limpiar directorios vacíos tras Move ──────────────────────────
+        //
+        // FIX: después de mover todos los archivos, los directorios del origen
+        // quedan vacíos. Los eliminamos de hoja a raíz.
+        // Solo si es Move y no fue totalmente cancelado.
+        let dirs_removed = if is_move && !any_cancelled {
+            let cleanup = remove_empty_dirs_after_move(source_root);
+            cleanup.removed
+        } else {
+            0
+        };
+
         let snapshot = telemetry.snapshot();
 
         Ok(CopyResult {
-            completed_files:   snapshot.completed_files,
-            failed_files:      snapshot.failed_files,
-            total_bytes:       snapshot.total_bytes,
-            copied_bytes:      snapshot.copied_bytes,
-            elapsed_secs:      snapshot.elapsed_secs,
+            completed_files:    snapshot.completed_files,
+            failed_files:       snapshot.failed_files,
+            total_bytes:        snapshot.total_bytes,
+            copied_bytes:       snapshot.copied_bytes,
+            elapsed_secs:       snapshot.elapsed_secs,
             revalidated_files,
             moved_files,
             move_delete_failed,
-            dry_run_report:    None,
+            dirs_removed,
+            dry_run_report:     None,
         })
     }
 
-    /// Ejecuta en modo dry-run: análisis sin escritura.
     fn run_dry(&self, source_root: &Path, dest_root: &Path) -> Result<CopyResult> {
-        // Cargar checkpoint si existe (para mostrar qué se saltaría)
         let job_id          = generate_job_id(source_root, dest_root);
         let checkpoint_path = CheckpointState::default_path(dest_root, &job_id);
 
@@ -325,25 +334,50 @@ impl Orchestrator {
         let runner  = DryRunner::new(&self.config, is_move, completed);
         let report  = runner.run(source_root, dest_root);
 
-        let total_files  = report.total_files;
-        let total_bytes  = report.total_bytes;
-        let skipped      = report.skipped_files;
-
         Ok(CopyResult {
             completed_files:    0,
             failed_files:       report.problem_files,
-            total_bytes,
-            copied_bytes:       0, // nada se copió
+            total_bytes:        report.total_bytes,
+            copied_bytes:       0,
             elapsed_secs:       0.0,
             revalidated_files:  0,
             moved_files:        0,
             move_delete_failed: 0,
+            dirs_removed:       0,
             dry_run_report:     Some(report),
         })
     }
 
+    /// Escanea el árbol de origen y construye la lista de `FileEntry`.
+    ///
+    /// ## Fix: source es archivo individual
+    ///
+    /// Si `source_root` es un archivo (no un directorio), `strip_prefix`
+    /// produce `relative = ""` y `dest_root.join("") == dest_root`.
+    /// El writer entonces genera `dest_root.partial` — incorrecto.
+    ///
+    /// Solución: cuando `source_root` es un archivo, `dest` se construye como
+    /// `dest_root / source_root.file_name()`.
     fn scan_files(&self, source_root: &Path, dest_root: &Path) -> Result<Vec<FileEntry>> {
         let mut files = Vec::new();
+
+        // Caso especial: source_root es un archivo individual
+        if source_root.is_file() {
+            let size     = std::fs::metadata(source_root).map(|m| m.len()).unwrap_or(0);
+            let filename = source_root.file_name()
+                .expect("source_root debe tener nombre de archivo");
+            // dest = dest_root/filename  (no dest_root sola)
+            let dest     = if dest_root.is_dir() {
+                dest_root.join(filename)
+            } else {
+                dest_root.to_path_buf() // el usuario especificó el path destino completo
+            };
+            let relative = PathBuf::from(filename);
+            files.push(FileEntry { source: source_root.to_path_buf(), dest, size, relative });
+            return Ok(files);
+        }
+
+        // Caso normal: source_root es un directorio
         for entry in WalkDir::new(source_root)
             .follow_links(false)
             .into_iter()
@@ -356,6 +390,7 @@ impl Orchestrator {
             let dest     = dest_root.join(&relative);
             files.push(FileEntry { source, dest, size, relative });
         }
+
         Ok(files)
     }
 }
