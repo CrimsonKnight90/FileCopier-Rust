@@ -10,6 +10,7 @@ tracing   = { workspace = true }
 thiserror = { workspace = true }
 anyhow    = { workspace = true }
 log       = { workspace = true }
+tokio     = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Crate `windows` para interfaces COM tipadas (IShellBrowser, UIAutomation, etc.)
@@ -43,9 +44,12 @@ windows-sys = { version = "0.59", features = [
     # COM
     "Win32_System_Com",             # CoInitializeEx, COINIT_APARTMENTTHREADED
     # Shell / Drag & Drop
-    "Win32_Shell",                  # DragQueryFileW, SHGetPathFromIDListW
+    "Win32_UI_Shell",              # DragQueryFileW, SHGetPathFromIDListW
+    "Win32_UI_Shell_Common",
     # Ventanas y mensajes
     "Win32_UI_WindowsAndMessaging", # CreateWindowExW, RegisterClassExW, GetMessageW, etc.
+    # Graphics Gdi (required for WNDCLASSEXW)
+    "Win32_Graphics_Gdi",
     # Consola
     "Win32_System_Console",         # SetConsoleCtrlHandler
     # LibraryLoader

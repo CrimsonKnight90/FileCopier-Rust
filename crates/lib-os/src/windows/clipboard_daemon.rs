@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
 
-use super::explorer_path::{get_active_explorer_path, is_explorer_window, prompt_folder_dialog};
+use super::explorer_path::{get_active_explorer_path, prompt_folder_dialog};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tipos públicos
@@ -147,15 +147,16 @@ pub fn run_daemon(config: DaemonConfig) -> Result<()> {
 }
 
 unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetMessageW, PostQuitMessage, RegisterClassExW, TranslateMessage,
-        HWND_MESSAGE, MSG, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+        HWND_MESSAGE, MSG, WNDCLASSEXW,
         WM_DESTROY, WM_CLIPBOARDUPDATE,
     };
     use windows_sys::Win32::System::DataExchange::AddClipboardFormatListener;
+    use windows_sys::Win32::UI::Shell::DragQueryFileW;
 
     // Inicializar COM para este thread (STA — necesario para IShellBrowser)
     use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -194,11 +195,11 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
         style:         0,
         cbClsExtra:    0,
         cbWndExtra:    0,
-        hIcon:         0,
-        hCursor:       0,
-        hbrBackground: 0,
+        hIcon:         std::ptr::null_mut(),
+        hCursor:       std::ptr::null_mut(),
+        hbrBackground: std::ptr::null_mut(),
         lpszMenuName:  std::ptr::null(),
-        hIconSm:       0,
+        hIconSm:       std::ptr::null_mut(),
     };
 
     let atom = RegisterClassExW(&wc);
@@ -217,10 +218,10 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
         0, // sin estilo (message-only no necesita)
         0, 0, 0, 0,
         HWND_MESSAGE, // ventana padre = HWND_MESSAGE → no visible
-        0, hinstance, std::ptr::null(),
+        std::ptr::null_mut(), hinstance, std::ptr::null(),
     );
 
-    if hwnd == 0 {
+    if hwnd.is_null() {
         bail!(
             "CreateWindowExW falló: {}",
             std::io::Error::last_os_error()
@@ -240,7 +241,7 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
     // Message loop — bloquea hasta WM_QUIT
     let mut msg: MSG = std::mem::zeroed();
     loop {
-        let ret = GetMessageW(&mut msg, 0, 0, 0);
+        let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
         if ret == 0 || ret == -1 {
             break;
         }
@@ -405,7 +406,6 @@ fn execute_operation(
         checkpoint::FlowControl,
         config::{EngineConfig, OperationMode},
         engine::Orchestrator,
-        os_ops::NoOpOsOps,
     };
 
     // Asegurar que el directorio destino existe
@@ -438,7 +438,7 @@ fn execute_operation(
 
         let flow   = FlowControl::new();
         let os_ops = std::sync::Arc::new(
-            lib_os::windows::fs::WindowsAdapter::new()
+            crate::windows::WindowsAdapter::new()
         ) as std::sync::Arc<dyn lib_core::os_ops::OsOps>;
 
         let start = std::time::Instant::now();
@@ -478,7 +478,7 @@ fn clipboard_has_hdrop() -> bool {
     unsafe {
         use windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable;
         use windows_sys::Win32::System::Ole::CF_HDROP;
-        IsClipboardFormatAvailable(CF_HDROP) != 0
+        IsClipboardFormatAvailable(CF_HDROP as u32) != 0
     }
 }
 
@@ -501,16 +501,15 @@ unsafe fn read_clipboard_impl() -> Option<PendingItem> {
     };
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows_sys::Win32::System::Ole::CF_HDROP;
-    use windows_sys::Win32::Shell::DragQueryFileW;
 
-    if OpenClipboard(0) == 0 { return None; }
+    if OpenClipboard(std::ptr::null_mut()) == 0 { return None; }
 
     let result = (|| {
         let seq = GetClipboardSequenceNumber();
 
         // Leer CF_HDROP
-        let hdrop = GetClipboardData(CF_HDROP);
-        if hdrop == 0 { return None; }
+        let hdrop = GetClipboardData(CF_HDROP as u32);
+        if hdrop.is_null() { return None; }
 
         let ptr = GlobalLock(hdrop as _);
         if ptr.is_null() { return None; }
@@ -552,7 +551,7 @@ unsafe fn read_drop_effect_inner() -> Option<PendingOperation> {
     if fmt == 0 { return None; }
 
     let handle = GetClipboardData(fmt);
-    if handle == 0 { return None; }
+    if handle.is_null() { return None; }
 
     let ptr = GlobalLock(handle as _) as *const u32;
     if ptr.is_null() { return None; }
