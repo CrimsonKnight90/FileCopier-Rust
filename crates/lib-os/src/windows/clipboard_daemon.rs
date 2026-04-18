@@ -87,36 +87,36 @@ impl std::fmt::Display for PendingOperation {
 /// Archivos en espera de ser pegados.
 #[derive(Debug, Clone)]
 pub struct PendingItem {
-    pub paths: Vec<PathBuf>,
+    pub paths:     Vec<PathBuf>,
     pub operation: PendingOperation,
     /// Número de secuencia del portapapeles cuando se capturó.
     /// Permite detectar si el portapapeles fue reemplazado antes de pegar.
-    pub sequence: u32,
+    pub sequence:  u32,
 }
 
 /// Configuración del daemon.
 #[derive(Clone)]
 pub struct DaemonConfig {
     /// Directorio destino fijo. Si `None`, se resuelve en tiempo de pegado.
-    pub fixed_dest: Option<PathBuf>,
+    pub fixed_dest:    Option<PathBuf>,
     /// Mostrar diálogo si no se puede resolver automáticamente.
     pub fallback_dialog: bool,
     /// Verificación de integridad post-copia.
-    pub verify: bool,
+    pub verify:        bool,
     pub block_size_mb: u64,
-    pub threshold_mb: u64,
-    pub channel_cap: usize,
+    pub threshold_mb:  u64,
+    pub channel_cap:   usize,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            fixed_dest: None,
+            fixed_dest:      None,
             fallback_dialog: true,
-            verify: false,
-            block_size_mb: 4,
-            threshold_mb: 16,
-            channel_cap: 8,
+            verify:          false,
+            block_size_mb:   4,
+            threshold_mb:    16,
+            channel_cap:     8,
         }
     }
 }
@@ -126,8 +126,8 @@ impl Default for DaemonConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct DaemonState {
-    queue: Option<PendingItem>,
-    config: DaemonConfig,
+    queue:   Option<PendingItem>,
+    config:  DaemonConfig,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -147,12 +147,15 @@ pub fn run_daemon(config: DaemonConfig) -> Result<()> {
 }
 
 unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
-    use windows_sys::Win32::System::DataExchange::AddClipboardFormatListener;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DispatchMessageW, GetMessageW, PostQuitMessage, RegisterClassExW,
-        TranslateMessage, HWND_MESSAGE, MSG, WNDCLASSEXW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        GetMessageW, PostQuitMessage, RegisterClassExW, TranslateMessage,
+        HWND_MESSAGE, MSG, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+        WM_DESTROY, WM_CLIPBOARDUPDATE,
     };
+    use windows_sys::Win32::System::DataExchange::AddClipboardFormatListener;
 
     // Inicializar COM para este thread (STA — necesario para IShellBrowser)
     use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -171,30 +174,31 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
 
     // Inicializar estado global
     let state = Arc::new(Mutex::new(DaemonState {
-        queue: None,
-        config: config.clone(),
+        queue:   None,
+        config:  config.clone(),
         runtime: Arc::clone(&runtime),
     }));
-    DAEMON_STATE.set(Arc::clone(&state)).unwrap_or(()); // puede fallar si el daemon se reinicia — ignorar
+    DAEMON_STATE.set(Arc::clone(&state))
+        .unwrap_or(()); // puede fallar si el daemon se reinicia — ignorar
 
     // Registrar clase de ventana
     let class_name: Vec<u16> = "FileCopierDaemon\0".encode_utf16().collect();
     let hinstance = GetModuleHandleW(std::ptr::null());
 
     let wc = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(daemon_wndproc),
-        hInstance: hinstance,
+        cbSize:        std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc:   Some(daemon_wndproc),
+        hInstance:     hinstance,
         lpszClassName: class_name.as_ptr(),
         // Todos los demás campos = 0/null
-        style: 0,
-        cbClsExtra: 0,
-        cbWndExtra: 0,
-        hIcon: std::ptr::null_mut(),
-        hCursor: std::ptr::null_mut(),
-        hbrBackground: std::ptr::null_mut(),
-        lpszMenuName: std::ptr::null(),
-        hIconSm: std::ptr::null_mut(),
+        style:         0,
+        cbClsExtra:    0,
+        cbWndExtra:    0,
+        hIcon:         0,
+        hCursor:       0,
+        hbrBackground: 0,
+        lpszMenuName:  std::ptr::null(),
+        hIconSm:       0,
     };
 
     let atom = RegisterClassExW(&wc);
@@ -211,18 +215,16 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
         class_name.as_ptr(),
         title.as_ptr(),
         0, // sin estilo (message-only no necesita)
-        0,
-        0,
-        0,
-        0,
+        0, 0, 0, 0,
         HWND_MESSAGE, // ventana padre = HWND_MESSAGE → no visible
-        std::ptr::null_mut(),
-        hinstance,
-        std::ptr::null(),
+        0, hinstance, std::ptr::null(),
     );
 
-    if hwnd.is_null() {
-        bail!("CreateWindowExW falló: {}", std::io::Error::last_os_error());
+    if hwnd == 0 {
+        bail!(
+            "CreateWindowExW falló: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     // Suscribirse a notificaciones del portapapeles
@@ -238,7 +240,7 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
     // Message loop — bloquea hasta WM_QUIT
     let mut msg: MSG = std::mem::zeroed();
     loop {
-        let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+        let ret = GetMessageW(&mut msg, 0, 0, 0);
         if ret == 0 || ret == -1 {
             break;
         }
@@ -254,8 +256,8 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
 /// # Safety
 /// Llamado por Windows desde el message loop — thread único, sin reentrancia.
 unsafe extern "system" fn daemon_wndproc(
-    hwnd: windows_sys::Win32::Foundation::HWND,
-    msg: u32,
+    hwnd:   windows_sys::Win32::Foundation::HWND,
+    msg:    u32,
     wparam: windows_sys::Win32::Foundation::WPARAM,
     lparam: windows_sys::Win32::Foundation::LPARAM,
 ) -> windows_sys::Win32::Foundation::LRESULT {
@@ -285,59 +287,29 @@ unsafe extern "system" fn daemon_wndproc(
 /// Llamada cada vez que el portapapeles cambia (WM_CLIPBOARDUPDATE).
 fn on_clipboard_update() {
     let has_hdrop = clipboard_has_hdrop();
-    let _seq = get_clipboard_sequence();
+    let seq       = get_clipboard_sequence();
 
     let state_arc = match DAEMON_STATE.get() {
         Some(s) => s,
-        None => return,
+        None    => return,
     };
 
     let mut state = match state_arc.lock() {
-        Ok(s) => s,
+        Ok(s)  => s,
         Err(_) => return,
     };
 
     if has_hdrop {
-        // El portapapeles tiene archivos. Puede ser:
-        //  1) Ctrl+C/Ctrl+X nuevo (guardar en cola)
-        //  2) Ctrl+V en Explorer (algunas versiones mantienen CF_HDROP y
-        //     solo agregan "Performed DropEffect").
+        // El portapapeles tiene archivos → el usuario hizo Ctrl+C o Ctrl+X.
+        // Leer los paths y guardarlos en la cola.
         match read_clipboard_files_and_op() {
             Some(item) => {
-                let performed_effect = unsafe { read_performed_drop_effect_inner() };
-                let is_same_as_pending = state
-                    .queue
-                    .as_ref()
-                    .map(|pending| {
-                        pending.paths == item.paths && pending.operation == item.operation
-                    })
-                    .unwrap_or(false);
-
-                if is_same_as_pending && performed_effect.is_some() {
-                    if !is_foreground_explorer_window() {
-                        tracing::debug!(
-                            "WM_CLIPBOARDUPDATE: Performed DropEffect fuera de Explorer, ignorando"
-                        );
-                        return;
-                    }
-
-                    // Explorer consumió Ctrl+V pero no removió CF_HDROP.
-                    let pending = match state.queue.take() {
-                        Some(p) => p,
-                        None => return,
-                    };
-                    execute_pending_item(&state, pending);
-                    return;
-                }
-
-                let op = item.operation;
+                let op    = item.operation;
                 let count = item.paths.len();
                 state.queue = Some(item);
                 println!();
-                println!(
-                    "  📋 {} {} archivo(s) en cola — ve a la carpeta destino y pega (Ctrl+V)",
-                    op, count
-                );
+                println!("  📋 {} {} archivo(s) en cola — ve a la carpeta destino y pega (Ctrl+V)",
+                    op, count);
             }
             None => {
                 // CF_HDROP pero no se pudo leer — ignorar
@@ -349,64 +321,51 @@ fn on_clipboard_update() {
         // Si teníamos archivos en cola, significa que se pegaron.
         let pending = match state.queue.take() {
             Some(p) => p,
-            None => {
+            None    => {
                 // Cola vacía — fue un pegado de texto u otro dato. Ignorar.
                 tracing::trace!("WM_CLIPBOARDUPDATE: sin cola pendiente, ignorando");
                 return;
             }
         };
 
-        if !is_foreground_explorer_window() {
-            // Evitar falsos positivos: cambios de portapapeles fuera de Explorer
-            // no deben disparar ejecución ni diálogo.
-            tracing::debug!(
-                "WM_CLIPBOARDUPDATE: CF_HDROP ausente fuera de Explorer; conservando cola"
-            );
-            state.queue = Some(pending);
+        // Verificar que los paths origen aún existen
+        let valid_paths: Vec<PathBuf> = pending.paths
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+
+        if valid_paths.is_empty() {
+            tracing::warn!("WM_CLIPBOARDUPDATE: todos los paths origen desaparecieron");
             return;
         }
 
-        execute_pending_item(&state, pending);
+        // Resolver el directorio destino
+        let dest = resolve_dest(&state.config);
+        let dest = match dest {
+            Some(d) => d,
+            None    => {
+                println!("  ⚠  No se pudo determinar la carpeta destino — operación cancelada");
+                // Restaurar la cola para el siguiente intento
+                // (el usuario puede hacer Ctrl+V de nuevo)
+                return;
+            }
+        };
+
+        println!();
+        println!("  ▶ {} {} elemento(s) → {}",
+            pending.operation, valid_paths.len(), dest.display());
+
+        // Lanzar la operación en el runtime compartido
+        let runtime = Arc::clone(&state.runtime);
+        let config  = state.config.clone();
+        let op      = pending.operation;
+
+        // Spawn en thread OS separado para no bloquear el UI thread
+        let runtime_ref = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            execute_operation(valid_paths, dest, op, &config, &runtime_ref);
+        });
     }
-}
-
-fn execute_pending_item(state: &DaemonState, pending: PendingItem) {
-    // Verificar que los paths origen aún existen
-    let valid_paths: Vec<PathBuf> = pending.paths.into_iter().filter(|p| p.exists()).collect();
-
-    if valid_paths.is_empty() {
-        tracing::warn!("WM_CLIPBOARDUPDATE: todos los paths origen desaparecieron");
-        return;
-    }
-
-    // Resolver el directorio destino
-    let dest = resolve_dest(&state.config);
-    let dest = match dest {
-        Some(d) => d,
-        None => {
-            println!("  ⚠  No se pudo determinar la carpeta destino — operación cancelada");
-            return;
-        }
-    };
-
-    println!();
-    println!(
-        "  ▶ {} {} elemento(s) → {}",
-        pending.operation,
-        valid_paths.len(),
-        dest.display()
-    );
-
-    // Lanzar la operación en el runtime compartido
-    let runtime = Arc::clone(&state.runtime);
-    let config = state.config.clone();
-    let op = pending.operation;
-
-    // Spawn en thread OS separado para no bloquear el UI thread
-    let runtime_ref = Arc::clone(&runtime);
-    std::thread::spawn(move || {
-        execute_operation(valid_paths, dest, op, &config, &runtime_ref);
-    });
 }
 
 /// Determina el directorio destino donde pegar.
@@ -430,18 +389,6 @@ fn resolve_dest(config: &DaemonConfig) -> Option<PathBuf> {
     None
 }
 
-fn is_foreground_explorer_window() -> bool {
-    unsafe {
-        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_null() {
-            return false;
-        }
-        is_explorer_window(hwnd)
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Ejecución de la operación
 // ─────────────────────────────────────────────────────────────────────────────
@@ -449,15 +396,16 @@ fn is_foreground_explorer_window() -> bool {
 /// Ejecuta la copia/movimiento de todos los paths hacia `dest`.
 fn execute_operation(
     sources: Vec<PathBuf>,
-    dest: PathBuf,
-    op: PendingOperation,
-    config: &DaemonConfig,
-    _rt: &Arc<tokio::runtime::Runtime>,
+    dest:    PathBuf,
+    op:      PendingOperation,
+    config:  &DaemonConfig,
+    _rt:     &Arc<tokio::runtime::Runtime>,
 ) {
     use lib_core::{
         checkpoint::FlowControl,
         config::{EngineConfig, OperationMode},
         engine::Orchestrator,
+        os_ops::NoOpOsOps,
     };
 
     // Asegurar que el directorio destino existe
@@ -469,12 +417,12 @@ fn execute_operation(
     }
 
     let engine_config = EngineConfig {
-        triage_threshold_bytes: config.threshold_mb * 1024 * 1024,
-        block_size_bytes: config.block_size_mb as usize * 1024 * 1024,
-        channel_capacity: config.channel_cap,
-        swarm_concurrency: 64,
-        verify: config.verify,
-        operation_mode: match op {
+        triage_threshold_bytes: config.threshold_mb  * 1024 * 1024,
+        block_size_bytes:       config.block_size_mb as usize * 1024 * 1024,
+        channel_capacity:       config.channel_cap,
+        swarm_concurrency:      64,
+        verify:                 config.verify,
+        operation_mode:         match op {
             PendingOperation::Copy => OperationMode::Copy,
             PendingOperation::Move => OperationMode::Move,
         },
@@ -488,33 +436,30 @@ fn execute_operation(
             continue;
         }
 
-        let flow = FlowControl::new();
-        let os_ops = std::sync::Arc::new(crate::windows::WindowsAdapter::new())
-            as std::sync::Arc<dyn lib_core::os_ops::OsOps>;
+        let flow   = FlowControl::new();
+        let os_ops = std::sync::Arc::new(
+            lib_os::windows::fs::WindowsAdapter::new()
+        ) as std::sync::Arc<dyn lib_core::os_ops::OsOps>;
 
         let start = std::time::Instant::now();
-        let orch = Orchestrator::new(engine_config.clone(), flow, os_ops);
+        let orch  = Orchestrator::new(engine_config.clone(), flow, os_ops);
 
         match orch.run(source, &dest, None) {
             Ok(result) => {
                 let elapsed = start.elapsed().as_secs_f64();
-                let mb = result.copied_bytes as f64 / 1024.0 / 1024.0;
+                let mb      = result.copied_bytes as f64 / 1024.0 / 1024.0;
                 println!(
                     "  ✓ {} → {} archivo(s), {:.1} MB en {:.1}s ({:.0} MB/s)",
                     source.file_name().unwrap_or_default().to_string_lossy(),
                     result.completed_files,
-                    mb,
-                    elapsed,
+                    mb, elapsed,
                     if elapsed > 0.0 { mb / elapsed } else { 0.0 }
                 );
                 if result.failed_files > 0 {
                     println!("    ⚠  {} error(es)", result.failed_files);
                 }
                 if result.dirs_removed > 0 {
-                    println!(
-                        "    ✓  {} carpeta(s) vacía(s) eliminadas",
-                        result.dirs_removed
-                    );
+                    println!("    ✓  {} carpeta(s) vacía(s) eliminadas", result.dirs_removed);
                 }
             }
             Err(e) => {
@@ -533,13 +478,15 @@ fn clipboard_has_hdrop() -> bool {
     unsafe {
         use windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable;
         use windows_sys::Win32::System::Ole::CF_HDROP;
-        IsClipboardFormatAvailable(CF_HDROP as u32) != 0
+        IsClipboardFormatAvailable(CF_HDROP) != 0
     }
 }
 
 /// Número de secuencia actual del portapapeles.
 fn get_clipboard_sequence() -> u32 {
-    unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+    unsafe {
+        windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber()
+    }
 }
 
 /// Lee los paths y la operación (Copy/Move) del portapapeles actual.
@@ -549,38 +496,31 @@ fn read_clipboard_files_and_op() -> Option<PendingItem> {
 
 unsafe fn read_clipboard_impl() -> Option<PendingItem> {
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
+        GetClipboardData, OpenClipboard, CloseClipboard,
+        GetClipboardSequenceNumber, RegisterClipboardFormatW,
     };
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows_sys::Win32::System::Ole::CF_HDROP;
-    use windows_sys::Win32::UI::Shell::DragQueryFileW;
+    use windows_sys::Win32::Shell::DragQueryFileW;
 
-    if OpenClipboard(std::ptr::null_mut()) == 0 {
-        return None;
-    }
+    if OpenClipboard(0) == 0 { return None; }
 
     let result = (|| {
         let seq = GetClipboardSequenceNumber();
 
         // Leer CF_HDROP
-        let hdrop = GetClipboardData(CF_HDROP as u32);
-        if hdrop.is_null() {
-            return None;
-        }
+        let hdrop = GetClipboardData(CF_HDROP);
+        if hdrop == 0 { return None; }
 
         let ptr = GlobalLock(hdrop as _);
-        if ptr.is_null() {
-            return None;
-        }
+        if ptr.is_null() { return None; }
 
         let count = DragQueryFileW(hdrop as _, 0xFFFF_FFFF, std::ptr::null_mut(), 0);
         let mut paths = Vec::with_capacity(count as usize);
 
         for i in 0..count {
             let len = DragQueryFileW(hdrop as _, i, std::ptr::null_mut(), 0) as usize;
-            if len == 0 {
-                continue;
-            }
+            if len == 0 { continue; }
             let mut buf = vec![0u16; len + 1];
             DragQueryFileW(hdrop as _, i, buf.as_mut_ptr(), buf.len() as u32);
             let s = String::from_utf16_lossy(&buf[..len]);
@@ -589,18 +529,12 @@ unsafe fn read_clipboard_impl() -> Option<PendingItem> {
 
         GlobalUnlock(hdrop as _);
 
-        if paths.is_empty() {
-            return None;
-        }
+        if paths.is_empty() { return None; }
 
         // Leer "Preferred DropEffect"
         let op = read_drop_effect_inner().unwrap_or(PendingOperation::Copy);
 
-        Some(PendingItem {
-            paths,
-            operation: op,
-            sequence: seq,
-        })
+        Some(PendingItem { paths, operation: op, sequence: seq })
     })();
 
     CloseClipboard();
@@ -608,24 +542,20 @@ unsafe fn read_clipboard_impl() -> Option<PendingItem> {
 }
 
 unsafe fn read_drop_effect_inner() -> Option<PendingOperation> {
-    use windows_sys::Win32::System::DataExchange::{GetClipboardData, RegisterClipboardFormatW};
+    use windows_sys::Win32::System::DataExchange::{
+        GetClipboardData, RegisterClipboardFormatW,
+    };
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 
     let name: Vec<u16> = "Preferred DropEffect\0".encode_utf16().collect();
-    let fmt = RegisterClipboardFormatW(name.as_ptr());
-    if fmt == 0 {
-        return None;
-    }
+    let fmt  = RegisterClipboardFormatW(name.as_ptr());
+    if fmt == 0 { return None; }
 
     let handle = GetClipboardData(fmt);
-    if handle.is_null() {
-        return None;
-    }
+    if handle == 0 { return None; }
 
     let ptr = GlobalLock(handle as _) as *const u32;
-    if ptr.is_null() {
-        return None;
-    }
+    if ptr.is_null() { return None; }
     let effect = *ptr;
     GlobalUnlock(handle as _);
 
@@ -634,29 +564,4 @@ unsafe fn read_drop_effect_inner() -> Option<PendingOperation> {
         2 => Some(PendingOperation::Move),
         _ => Some(PendingOperation::Copy),
     }
-}
-
-unsafe fn read_performed_drop_effect_inner() -> Option<u32> {
-    use windows_sys::Win32::System::DataExchange::{GetClipboardData, RegisterClipboardFormatW};
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-
-    let name: Vec<u16> = "Performed DropEffect\0".encode_utf16().collect();
-    let fmt = RegisterClipboardFormatW(name.as_ptr());
-    if fmt == 0 {
-        return None;
-    }
-
-    let handle = GetClipboardData(fmt);
-    if handle.is_null() {
-        return None;
-    }
-
-    let ptr = GlobalLock(handle as _) as *const u32;
-    if ptr.is_null() {
-        return None;
-    }
-    let effect = *ptr;
-    GlobalUnlock(handle as _);
-
-    Some(effect)
 }

@@ -63,22 +63,20 @@ fn try_ishellbrowser() -> Option<PathBuf> {
 
 unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
     use windows::Win32::UI::Shell::{
-        IShellBrowser, IShellView, IShellWindows, ShellWindows, SHGetPathFromIDListW,
+        IShellBrowser, IShellView, IShellWindows,
+        SHGetPathFromIDListW, ShellWindows,
     };
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx,
+        CoCreateInstance, CoInitializeEx, CoUninitialize,
         CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
     };
+    use windows::Win32::Foundation::HWND;
     use windows::core::{Interface, VARIANT};
 
     // Inicializar COM en modo STA para este thread
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
     let foreground = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-
-    if foreground.is_null() {
-        return None;
-    }
 
     // Crear instancia de ShellWindows (colección de ventanas Explorer)
     let shell_windows: IShellWindows = CoCreateInstance(
@@ -90,7 +88,7 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
     let count = shell_windows.Count().ok()?;
 
     for i in 0..count {
-        let item = shell_windows.Item(&VARIANT::from(i as i32)).ok()?;
+        let item = shell_windows.Item(VARIANT::from(i)).ok()?;
 
         // Obtener IDispatch → IWebBrowserApp → IServiceProvider → IShellBrowser
         use windows::Win32::System::Com::IServiceProvider;
@@ -108,9 +106,17 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
 
         // Obtener IShellBrowser via IServiceProvider
         let service_provider: IServiceProvider = browser_app.cast().ok()?;
-        let shell_browser: IShellBrowser = service_provider
-            .QueryService(&windows::Win32::UI::Shell::SID_STopLevelBrowser)
-            .ok()?;
+        let shell_browser: IShellBrowser = {
+            let mut out = std::mem::zeroed();
+            service_provider
+                .QueryService(
+                    &windows::Win32::UI::Shell::SID_STopLevelBrowser,
+                    &IShellBrowser::IID,
+                    &mut out,
+                )
+                .ok()?;
+            IShellBrowser::from_raw(out as _)
+        };
 
         // Obtener la vista activa
         let shell_view: IShellView = shell_browser.QueryActiveShellView().ok()?;
@@ -126,8 +132,8 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
         let pidl = persist.GetCurFolder().ok()?;
 
         // Convertir PIDL a path
-        let mut buf = [0u16; 260];
-        if SHGetPathFromIDListW(pidl, &mut buf).as_bool() {
+        let mut buf = [0u16; 32768];
+        if SHGetPathFromIDListW(pidl.as_ptr() as _, &mut buf).is_ok() {
             let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
             let s = String::from_utf16_lossy(&buf[..len]);
             if !s.is_empty() {
@@ -150,18 +156,17 @@ fn try_ui_automation() -> Option<PathBuf> {
 unsafe fn try_ui_automation_impl() -> Option<PathBuf> {
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationElement,
-        UIA_NamePropertyId, UIA_ControlTypePropertyId, UIA_EditControlTypeId,
-        IUIAutomationCondition, TreeScope_Descendants, UIA_ValuePatternId,
+        UIA_EditControlTypeId, UIA_NamePropertyId,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
-    use windows::core::{Interface, BSTR, VARIANT};
+    use windows::core::BSTR;
 
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
     let foreground_hwnd = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-    if foreground_hwnd.is_null() {
+    if foreground_hwnd == 0 {
         return None;
     }
 
@@ -177,15 +182,21 @@ unsafe fn try_ui_automation_impl() -> Option<PathBuf> {
     ).ok()?;
 
     // Obtener elemento raíz de la ventana foreground
+    use windows::Win32::Foundation::HWND;
     let root: IUIAutomationElement = automation
-        .ElementFromHandle(windows::Win32::Foundation::HWND(foreground_hwnd))
+        .ElementFromHandle(HWND(foreground_hwnd as _))
         .ok()?;
+
+    // Buscar el campo de dirección (Edit con Name="Address" o accesibilidad similar)
+    use windows::Win32::UI::Accessibility::{
+        IUIAutomationCondition, TreeScope_Descendants,
+    };
 
     // Crear condición: ControlType == Edit
     let condition: IUIAutomationCondition = automation
         .CreatePropertyCondition(
-            UIA_ControlTypePropertyId,
-            &VARIANT::from(UIA_EditControlTypeId.0 as i32),
+            UIA_EditControlTypeId,
+            &windows::core::VARIANT::from(UIA_EditControlTypeId.0 as i32),
         )
         .ok()?;
 
@@ -199,15 +210,22 @@ unsafe fn try_ui_automation_impl() -> Option<PathBuf> {
         let elem: IUIAutomationElement = elements.GetElement(i).ok()?;
 
         // Leer el Name para identificar la barra de dirección
-        let name_val = elem.GetCurrentPropertyValue(UIA_NamePropertyId).ok()?;
-        let name_str: String = name_val.to_string();
+        let name: BSTR = elem
+            .GetCurrentPropertyValue(UIA_NamePropertyId)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .unwrap_or_default();
 
+        let name_str = name.to_string();
         if !name_str.contains("Address") && !name_str.contains("Dirección") {
             continue;
         }
 
         // Obtener el valor (path actual)
-        let pattern: windows::Win32::UI::Accessibility::IUIAutomationValuePattern = elem
+        use windows::Win32::UI::Accessibility::{
+            IUIAutomationValuePattern, UIA_ValuePatternId,
+        };
+        let pattern: IUIAutomationValuePattern = elem
             .GetCurrentPattern(UIA_ValuePatternId)
             .ok()?
             .cast()
@@ -239,7 +257,7 @@ fn try_window_title() -> Option<PathBuf> {
         };
 
         let hwnd = GetForegroundWindow();
-        if hwnd.is_null() { return None; }
+        if hwnd == 0 { return None; }
         if !is_explorer_window(hwnd) { return None; }
 
         let len = GetWindowTextLengthW(hwnd) as usize;
