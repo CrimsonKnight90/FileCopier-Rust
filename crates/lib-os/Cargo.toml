@@ -10,24 +10,48 @@ tracing   = { workspace = true }
 thiserror = { workspace = true }
 anyhow    = { workspace = true }
 log       = { workspace = true }
-tokio     = { version = "1", features = ["rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
+# Crate `windows` para interfaces COM tipadas (IShellBrowser, UIAutomation, etc.)
 windows = { version = "0.58", features = [
+    # COM base
     "Win32_System_Com",
     "Win32_Foundation",
+    # Shell / Explorer
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    # UI Automation (AddressBar de Explorer)
+    "Win32_UI_Accessibility",
+    # ShellWindows (colección de ventanas Explorer)
+    "Win32_System_Ole",
 ] }
+
+# Crate `windows-sys` para APIs procedurales (más ligero para WndProc, mensajes, etc.)
 windows-sys = { version = "0.59", features = [
-    "Win32_Storage_FileSystem",   # GetDriveTypeW, SetFileInformationByHandle, SetFileAttributesW, CreateFileW, GetDiskFreeSpaceExW
-    "Win32_Foundation",           # HANDLE, BOOL, INVALID_HANDLE_VALUE, CloseHandle
-    "Win32_System_IO",            # DeviceIoControl
-    "Win32_Security",             # SECURITY_ATTRIBUTES
-    "Win32_System_DataExchange",  # OpenClipboard, GetClipboardData, CloseClipboard, IsClipboardFormatAvailable, RegisterClipboardFormatW, EmptyClipboard, GetClipboardSequenceNumber
-    "Win32_System_Memory",        # GlobalLock, GlobalUnlock, GlobalSize
-    "Win32_System_Ole",           # CF_HDROP, DROPEFFECT_*
-    "Win32_System_Console",       # SetConsoleCtrlHandler (para app-cli)
-    "Win32_UI_Shell",             # DragQueryFileW, HDROP
-    "Win32_UI_WindowsAndMessaging", # OpenClipboard hwnd parameter type
+    # Filesystem y Storage
+    "Win32_Storage_FileSystem",     # GetDriveTypeW, SetFileInformationByHandle, etc.
+    # Foundation
+    "Win32_Foundation",             # HWND, HANDLE, BOOL, etc.
+    # I/O
+    "Win32_System_IO",              # DeviceIoControl
+    # Seguridad
+    "Win32_Security",               # SECURITY_ATTRIBUTES
+    # Portapapeles
+    "Win32_System_DataExchange",    # OpenClipboard, GetClipboardData, AddClipboardFormatListener, etc.
+    "Win32_System_Memory",          # GlobalLock, GlobalUnlock
+    "Win32_System_Ole",             # CF_HDROP, DROPEFFECT_*
+    # COM
+    "Win32_System_Com",             # CoInitializeEx, COINIT_APARTMENTTHREADED
+    # Shell / Drag & Drop
+    "Win32_Shell",                  # DragQueryFileW, SHGetPathFromIDListW
+    # Ventanas y mensajes
+    "Win32_UI_WindowsAndMessaging", # CreateWindowExW, RegisterClassExW, GetMessageW, etc.
+    # Consola
+    "Win32_System_Console",         # SetConsoleCtrlHandler
+    # LibraryLoader
+    "Win32_System_LibraryLoader",   # GetModuleHandleW
+    # Disco
+    "Win32_Storage_FileSystem",     # GetDiskFreeSpaceExW
 ] }
 
 [target.'cfg(unix)'.dependencies]

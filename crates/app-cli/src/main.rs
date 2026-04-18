@@ -1,4 +1,3 @@
-//! crates/app-cli/src/main.rs
 //! # filecopier CLI
 
 use std::path::PathBuf;
@@ -30,9 +29,11 @@ use lib_os::traits::DriveKind;
     after_help  = "Ejemplos:\n\
                   filecopier C:\\src C:\\dst\n\
                   filecopier --move C:\\src C:\\dst\n\
-                  filecopier --dry-run --move C:\\src C:\\dst\n\
+                  filecopier --dry-run --move C:\\src C:\\dst\n\n\
+                  # Daemon de portapapeles (intercepta Ctrl+C/Ctrl+X/Ctrl+V):\n\
+                  filecopier --watch-clipboard\n\
                   filecopier --watch-clipboard --dest-dir D:\\Backup\n\
-                  filecopier --watch-clipboard              # pide carpeta en cada operación"
+                  filecopier --watch-clipboard --verify"
 )]
 struct Cli {
     /// Ruta de origen. Omitir con --watch-clipboard.
@@ -45,7 +46,7 @@ struct Cli {
 
     // ── Operación ──────────────────────────────────────────────────────────
 
-    /// Mover: copiar → verificar → borrar origen.
+    /// Mover: copiar → verificar → borrar origen y carpetas vacías.
     #[arg(long, short = 'm')]
     r#move: bool,
 
@@ -53,21 +54,31 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
-    // ── Daemon ────────────────────────────────────────────────────────────
+    // ── Daemon de portapapeles ─────────────────────────────────────────────
+    //
+    // NUEVO: usa WM_CLIPBOARDUPDATE (event-driven, 0% CPU en idle).
+    // Flujo:
+    //   1. Ctrl+C / Ctrl+X  →  FileCopier guarda paths en cola
+    //   2. Ctrl+V en Explorer  →  FileCopier detecta el pegado,
+    //      resuelve la carpeta destino (IShellBrowser / UIAutomation)
+    //      y ejecuta la operación
 
-    /// [Windows] Interceptar Ctrl+C / Ctrl+X del Explorer.
+    /// [Windows] Daemon de portapapeles event-driven.
+    /// Intercepta Ctrl+C, Ctrl+X y Ctrl+V sobre archivos en Explorer.
+    /// No requiere especificar destino — lo detecta automáticamente.
     #[arg(long)]
     watch_clipboard: bool,
 
-    /// Directorio destino fijo para el daemon.
-    /// Si se omite, el daemon usa una carpeta temporal por defecto (%TEMP%\FileCopier)
-    /// y NO muestra ventanas emergentes, permitiendo automatización completa.
+    /// Destino fijo para el daemon. Si se omite, se detecta la carpeta
+    /// activa en Explorer al hacer Ctrl+V. Si no se puede detectar,
+    /// muestra un diálogo de selección.
     #[arg(long, value_name = "DIR")]
     dest_dir: Option<PathBuf>,
 
-    /// Intervalo de polling del portapapeles (ms). Default: 500
-    #[arg(long, default_value_t = 500, value_name = "MS")]
-    clipboard_interval: u64,
+    /// Con --watch-clipboard: mostrar diálogo si no se detecta destino.
+    /// Default: true. Usar --no-fallback-dialog para deshabilitar.
+    #[arg(long, default_value_t = true)]
+    fallback_dialog: bool,
 
     // ── Verificación ────────────────────────────────────────────────────────
 
@@ -137,7 +148,7 @@ fn main() {
 
     if cli.watch_clipboard {
         if let Err(e) = run_clipboard_daemon(&cli) {
-            eprintln!("\n❌ Error en daemon de portapapeles: {e}");
+            eprintln!("\n❌ Error en daemon: {e}");
             std::process::exit(1);
         }
         return;
@@ -150,7 +161,7 @@ fn main() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Operación normal (copy / move / dry-run)
+// Operación normal
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn run(cli: Cli) -> lib_core::error::Result<()> {
@@ -162,7 +173,8 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
         std::process::exit(2);
     }
 
-    let config = build_config(&cli, source, dest);
+    let mut config = build_config(&cli);
+    apply_hardware_detection(&mut config, source, dest, &cli);
     config.validate()?;
 
     if !cli.quiet {
@@ -192,13 +204,12 @@ fn run(cli: Cli) -> lib_core::error::Result<()> {
 
     if !cli.quiet { println!(); }
     print_summary(&result, start.elapsed());
-
     if result.failed_files > 0 { std::process::exit(3); }
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Daemon de portapapeles
+// Daemon de portapapeles (WM_CLIPBOARDUPDATE)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn run_clipboard_daemon(cli: &Cli) -> lib_core::error::Result<()> {
@@ -209,166 +220,54 @@ fn run_clipboard_daemon(cli: &Cli) -> lib_core::error::Result<()> {
     }
 
     #[cfg(windows)]
-    run_clipboard_daemon_windows(cli)
-}
+    {
+        use lib_os::windows::clipboard_daemon::{DaemonConfig, run_daemon};
 
-#[cfg(windows)]
-fn run_clipboard_daemon_windows(cli: &Cli) -> lib_core::error::Result<()> {
-    use lib_os::windows::clipboard::{ClipboardOperation, ClipboardWatcher};
+        let config = DaemonConfig {
+            fixed_dest:      cli.dest_dir.clone(),
+            fallback_dialog: cli.fallback_dialog,
+            verify:          cli.verify,
+            block_size_mb:   cli.block_size,
+            threshold_mb:    cli.threshold,
+            channel_cap:     cli.channel_cap,
+        };
 
-    // Si no se proporciona --dest-dir, usar %TEMP%\FileCopier como destino por defecto
-    let fixed_dest = cli.dest_dir.clone().unwrap_or_else(|| {
-        let temp_dir = std::env::temp_dir().join("FileCopier");
-        if !temp_dir.exists() {
-            let _ = std::fs::create_dir_all(&temp_dir);
+        // Validar el destino fijo si se proporcionó
+        if let Some(ref d) = config.fixed_dest {
+            if !d.exists() {
+                std::fs::create_dir_all(d).map_err(|e| {
+                    lib_core::error::CoreError::io(d, e)
+                })?;
+            }
         }
-        temp_dir
-    });
 
-    // Validar/crear el destino fijo
-    if !fixed_dest.exists() {
-        std::fs::create_dir_all(&fixed_dest).map_err(|e| {
-            lib_core::error::CoreError::io(&fixed_dest, e)
-        })?;
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("  FileCopier-Rust — Daemon de portapapeles");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        match &config.fixed_dest {
+            Some(d) => println!("  Destino fijo:   {}", d.display()),
+            None    => println!("  Destino:        [detectado automáticamente al pegar]"),
+        }
+        println!("  Verificación:   {}", if config.verify { "✓" } else { "✗" });
+        println!("  Diálogo backup: {}", if config.fallback_dialog { "✓" } else { "✗" });
+        println!();
+        println!("  ┌─ Cómo usar ──────────────────────────────────────┐");
+        println!("  │  1. Selecciona archivos en Explorer               │");
+        println!("  │  2. Ctrl+C (copiar) o Ctrl+X (mover)             │");
+        println!("  │     FileCopier guarda los archivos en cola        │");
+        println!("  │  3. Ve a la carpeta destino en Explorer           │");
+        println!("  │  4. Ctrl+V (pegar)                                │");
+        println!("  │     FileCopier detecta el destino y opera         │");
+        println!("  └──────────────────────────────────────────────────┘");
+        println!();
+        println!("  Presiona Ctrl+C en esta ventana para detener.");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        run_daemon(config)
+            .map_err(|e| lib_core::error::CoreError::InvalidConfig {
+                message: e.to_string(),
+            })?;
     }
-
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  FileCopier-Rust — Daemon de portapapeles");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  Destino:      {}", fixed_dest.display());
-    println!("  Intervalo:    {} ms", cli.clipboard_interval);
-    println!();
-    println!("  Selecciona archivos en Explorer y presiona:");
-    println!("    Ctrl+C → copiar al destino");
-    println!("    Ctrl+X → mover al destino (borra el origen)");
-    println!();
-    println!("  Presiona Ctrl+C en esta ventana para detener el daemon.");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    // FIX: crear el runtime tokio UNA sola vez fuera del loop de eventos.
-    // Antes se creaba dentro del closure en cada evento, y su drop() al salir
-    // del closure interrumpía el canal crossbeam → "Pipeline interrumpido".
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_io()
-        .enable_time()
-        .thread_name("filecopier-worker")
-        .build()
-        .expect("No se pudo crear runtime tokio");
-
-    let verify      = cli.verify;
-    let block_size  = cli.block_size;
-    let threshold   = cli.threshold;
-    let channel_cap = cli.channel_cap;
-    let no_detect   = cli.no_detect;
-
-    let mut watcher = ClipboardWatcher::new();
-
-    watcher.watch(
-        cli.clipboard_interval,
-        &runtime,
-        // dest_resolver: retorna el directorio destino para cada evento
-        // Ahora siempre retorna fixed_dest (no hay diálogo)
-        |_event| Some(fixed_dest.clone()),
-        // on_event: ejecuta la operación
-        move |event, dest_dir, rt| {
-            // Asegurar que el directorio destino existe
-            if !dest_dir.exists() {
-                if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-                    println!("  ✗ No se pudo crear destino '{}': {}", dest_dir.display(), e);
-                    return true; // continuar el daemon
-                }
-            }
-
-            let op_label = match event.operation {
-                ClipboardOperation::Copy => "COPIAR",
-                ClipboardOperation::Move => "MOVER",
-            };
-
-            println!();
-            println!("  ▶ {} {} elemento(s) → {}",
-                op_label, event.paths.len(), dest_dir.display());
-
-            for source_path in &event.paths {
-                println!("    {}", source_path.display());
-
-                if !source_path.exists() {
-                    println!("    ⚠  No existe, saltando");
-                    continue;
-                }
-
-                let config = EngineConfig {
-                    triage_threshold_bytes: threshold * 1024 * 1024,
-                    block_size_bytes:       block_size as usize * 1024 * 1024,
-                    channel_capacity:       channel_cap,
-                    // FIX: usar más workers para archivos grandes en el daemon
-                    swarm_concurrency:      64,
-                    verify,
-                    operation_mode: match event.operation {
-                        ClipboardOperation::Copy => OperationMode::Copy,
-                        ClipboardOperation::Move => OperationMode::Move,
-                    },
-                    dry_run: false,
-                    ..EngineConfig::default()
-                };
-
-                let flow   = FlowControl::new();
-                let os_ops: Arc<dyn lib_core::os_ops::OsOps> = if !no_detect {
-                    lib_os::platform_adapter_os_ops().into()
-                } else {
-                    Arc::new(lib_core::os_ops::NoOpOsOps)
-                };
-
-                let start = Instant::now();
-
-                // FIX: usar el runtime compartido en lugar de crear uno nuevo.
-                // Pasar el runtime al Orchestrator a través de block_on no es
-                // posible directamente, pero el Orchestrator crea su propio
-                // runtime para el enjambre. Para archivos grandes, el BlockEngine
-                // usa threads OS — no tokio — así que no hay conflicto.
-                //
-                // El fix real está en que ya no hacemos `drop(runtime)` en cada
-                // evento porque el runtime vive fuera del closure.
-                let orch = Orchestrator::new(config, flow, os_ops);
-
-                match orch.run(source_path, &dest_dir, None) {
-                    Ok(result) => {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        let mb      = result.copied_bytes as f64 / 1024.0 / 1024.0;
-
-                        println!(
-                            "    ✓ {} archivo(s), {:.1} MB en {:.1}s ({:.0} MB/s)",
-                            result.completed_files, mb, elapsed,
-                            if elapsed > 0.0 { mb / elapsed } else { 0.0 }
-                        );
-
-                        if result.failed_files > 0 {
-                            println!("    ⚠  {} error(es)", result.failed_files);
-                        }
-
-                        if result.move_delete_failed > 0 {
-                            println!(
-                                "    ⚠  {} origen(es) no se pudieron borrar",
-                                result.move_delete_failed
-                            );
-                        }
-
-                        if result.dirs_removed > 0 {
-                            println!(
-                                "    ✓ {} carpeta(s) vacía(s) eliminadas del origen",
-                                result.dirs_removed
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        println!("    ✗ Error: {}", e);
-                    }
-                }
-            }
-
-            true // continuar el daemon
-        },
-    );
 
     Ok(())
 }
@@ -377,7 +276,7 @@ fn run_clipboard_daemon_windows(cli: &Cli) -> lib_core::error::Result<()> {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_config(cli: &Cli, _source: &std::path::Path, _dest: &std::path::Path) -> EngineConfig {
+fn build_config(cli: &Cli) -> EngineConfig {
     let algorithm = Algorithm::from_str(&cli.hasher).unwrap_or(Algorithm::Blake3);
     EngineConfig {
         triage_threshold_bytes: cli.threshold  * 1024 * 1024,
@@ -396,6 +295,45 @@ fn build_config(cli: &Cli, _source: &std::path::Path, _dest: &std::path::Path) -
     }
 }
 
+fn apply_hardware_detection(
+    config:    &mut EngineConfig,
+    source:    &std::path::Path,
+    dest:      &std::path::Path,
+    cli:       &Cli,
+) {
+    if cli.no_detect { return; }
+    let adapter  = lib_os::platform_adapter();
+    let strategy = adapter.compute_strategy(source, dest);
+    if cli.swarm_limit == 128 {
+        config.swarm_concurrency = if cli.verify {
+            strategy.recommended_swarm_concurrency_verify
+        } else {
+            strategy.recommended_swarm_concurrency
+        };
+    }
+    if cli.block_size == 4 {
+        config.block_size_bytes = strategy.recommended_block_size;
+    }
+    if !cli.quiet {
+        let lbl = |k: DriveKind| match k {
+            DriveKind::Ssd     => "SSD/NVMe",
+            DriveKind::Hdd     => "HDD",
+            DriveKind::Network => "Red",
+            DriveKind::Unknown => "?",
+        };
+        let c = if cli.verify {
+            strategy.recommended_swarm_concurrency_verify
+        } else {
+            strategy.recommended_swarm_concurrency
+        };
+        println!(
+            "  Hardware: {} → {}  |  enjambre={} bloque={}MB",
+            lbl(strategy.source_kind), lbl(strategy.dest_kind),
+            c, strategy.recommended_block_size / 1024 / 1024,
+        );
+    }
+}
+
 fn make_orchestrator(
     config:    EngineConfig,
     flow:      FlowControl,
@@ -410,12 +348,12 @@ fn make_orchestrator(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handlers de señal
+// Señales
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn install_ctrlc_handler(flow: FlowControl, signal_count: Arc<AtomicU32>) {
-    #[cfg(windows)]  install_windows(flow, signal_count);
-    #[cfg(unix)]     install_unix(flow, signal_count);
+fn install_ctrlc_handler(flow: FlowControl, sc: Arc<AtomicU32>) {
+    #[cfg(windows)]  install_windows(flow, sc);
+    #[cfg(unix)]     install_unix(flow, sc);
 }
 
 #[cfg(windows)]
@@ -470,7 +408,7 @@ fn print_config_banner(config: &EngineConfig, source: &std::path::Path, dest: &s
         OperationMode::Copy => "copiar",
         OperationMode::Move => "MOVER (borra origen tras copia exitosa)",
     };
-    let dry = if config.dry_run { " [DRY-RUN — sin cambios]" } else { "" };
+    let dry = if config.dry_run { " [DRY-RUN]" } else { "" };
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  FileCopier-Rust v{}{}", env!("CARGO_PKG_VERSION"), dry);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -482,26 +420,10 @@ fn print_config_banner(config: &EngineConfig, source: &std::path::Path, dest: &s
     println!(
         "  Verif.:    {}",
         if config.verify { format!("✓ ({})", config.hash_algorithm) }
-        else { "✗".into() }
+        else             { "✗".into() }
     );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
-}
-
-fn print_hardware_info(strategy: &lib_os::traits::CopyStrategy, verify: bool) {
-    let lbl = |k: DriveKind| match k {
-        DriveKind::Ssd     => "SSD/NVMe",
-        DriveKind::Hdd     => "HDD",
-        DriveKind::Network => "Red",
-        DriveKind::Unknown => "?",
-    };
-    let c = if verify { strategy.recommended_swarm_concurrency_verify }
-            else       { strategy.recommended_swarm_concurrency };
-    println!(
-        "  Hardware: {} → {}  |  enjambre={} bloque={}MB",
-        lbl(strategy.source_kind), lbl(strategy.dest_kind),
-        c, strategy.recommended_block_size / 1024 / 1024,
-    );
 }
 
 fn print_progress(p: &CopyProgress) {
@@ -513,12 +435,13 @@ fn print_progress(p: &CopyProgress) {
             .and_then(|x| x.to_str()).unwrap_or(name);
         let fi = (p.current_file_progress * 10.0) as usize;
         let ib = "█".repeat(fi.min(10)) + &"░".repeat(10usize.saturating_sub(fi));
-        print!("\r  [{bar}] {:.1}%  {}  {}/{}  ETA:{}  |{}: [{}]{:.0}%",
+        print!("\r  [{bar}] {:.1}%  {}  {}/{}  ETA:{}  | {}: [{}]{:.0}%",
             p.percent, p.throughput_human(), p.completed_files, p.total_files,
             p.eta_human(), n, ib, p.current_file_progress * 100.0);
     } else {
         print!("\r  [{bar}] {:.1}%  {}  {}/{}  ETA:{}    ",
-            p.percent, p.throughput_human(), p.completed_files, p.total_files, p.eta_human());
+            p.percent, p.throughput_human(), p.completed_files, p.total_files,
+            p.eta_human());
     }
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -529,16 +452,16 @@ fn print_summary(r: &lib_core::engine::orchestrator::CopyResult, elapsed: std::t
     let spd = if elapsed.as_secs_f64() > 0.0 { mb / elapsed.as_secs_f64() } else { 0.0 };
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  Completados:  {} archivos", r.completed_files);
-    if r.failed_files       > 0 { println!("  ⚠  Fallidos:              {}", r.failed_files); }
-    if r.revalidated_files  > 0 { println!("  ↺  Revalidados:           {}", r.revalidated_files); }
-    if r.moved_files        > 0 { println!("  ✂  Movidos:               {}", r.moved_files); }
-    if r.move_delete_failed > 0 { println!("  ⚠  Origen no borrado:     {}", r.move_delete_failed); }
-    if r.dirs_removed       > 0 { println!("  📁 Carpetas vacías borradas: {}", r.dirs_removed); }
+    if r.failed_files       > 0 { println!("  ⚠  Fallidos:           {}", r.failed_files); }
+    if r.revalidated_files  > 0 { println!("  ↺  Revalidados:        {}", r.revalidated_files); }
+    if r.moved_files        > 0 { println!("  ✂  Movidos:            {}", r.moved_files); }
+    if r.move_delete_failed > 0 { println!("  ⚠  Origen no borrado:  {}", r.move_delete_failed); }
+    if r.dirs_removed       > 0 { println!("  📁 Carpetas vacías:    {}", r.dirs_removed); }
     println!("  Datos:        {:.1} MB", mb);
     println!("  Tiempo:       {:.2}s", elapsed.as_secs_f64());
     println!("  Velocidad:    {:.1} MB/s", spd);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    if r.failed_files == 0 { println!("  ✓ Completado exitosamente"); }
+    if r.failed_files == 0 { println!("  ✓ Completado"); }
     else { println!("  ⚠  {} error(es)", r.failed_files); }
 }
 
