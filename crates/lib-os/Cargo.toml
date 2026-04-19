@@ -50,6 +50,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell_Common",
     # Ventanas y mensajes
     "Win32_UI_WindowsAndMessaging", # CreateWindowExW, RegisterClassExW, GetMessageW, etc.
+    # Teclado
+    "Win32_UI_Input_KeyboardAndMouse", # VK_V, GetKeyState, KBDLLHOOKSTRUCT
     # Graphics Gdi (required for WNDCLASSEXW)
     "Win32_Graphics_Gdi",
     # Consola

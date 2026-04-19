@@ -122,7 +122,7 @@ impl Default for DaemonConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Estado global del daemon (accedido desde WndProc)
+// Estado global del daemon (accedido desde WndProc y keyboard hook)
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct DaemonState {
@@ -131,9 +131,12 @@ struct DaemonState {
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
-// SAFETY: el estado solo se accede desde el UI thread (wndproc).
-// El Arc<Mutex> permite compartirlo con el thread de ejecución.
 static DAEMON_STATE: std::sync::OnceLock<Arc<Mutex<DaemonState>>> = std::sync::OnceLock::new();
+
+// Handle del hook de teclado global — guardado para poder desinstalarlo.
+static KEYBOARD_HOOK: std::sync::OnceLock
+    windows_sys::Win32::UI::WindowsAndMessaging::HHOOK,
+> = std::sync::OnceLock::new();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Daemon principal
@@ -225,7 +228,7 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
         bail!("CreateWindowExW falló: {}", std::io::Error::last_os_error());
     }
 
-    // Suscribirse a notificaciones del portapapeles
+   // Suscribirse a notificaciones del portapapeles
     if AddClipboardFormatListener(hwnd) == 0 {
         bail!(
             "AddClipboardFormatListener falló: {}",
@@ -233,7 +236,24 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
         );
     }
 
-    tracing::info!("Daemon iniciado — esperando eventos del portapapeles...");
+    // Instalar hook de teclado global (WH_KEYBOARD_LL).
+    // Este hook se ejecuta en el mismo thread que tiene el message loop,
+    // por lo que no necesita un thread separado. Intercepta Ctrl+V en
+    // CUALQUIER aplicación, incluyendo Explorer, ANTES de que Explorer
+    // procese la pulsación.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowsHookExW, WH_KEYBOARD_LL,
+    };
+    let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), std::ptr::null_mut(), 0);
+    if hook.is_null() {
+        bail!(
+            "SetWindowsHookExW falló: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    KEYBOARD_HOOK.set(hook).ok();
+
+    tracing::info!("Daemon iniciado — hook de teclado activo, esperando Ctrl+V...");
 
     // Message loop — bloquea hasta WM_QUIT
     let mut msg: MSG = std::mem::zeroed();
@@ -247,6 +267,109 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Hook de teclado de bajo nivel (WH_KEYBOARD_LL).
+///
+/// Se llama ANTES de que la aplicación destino (Explorer) reciba la tecla.
+/// Detecta Ctrl+V y, si hay archivos en cola, cancela el evento de teclado
+/// (retorna 1) y despacha la operación de FileCopier.
+///
+/// # Safety
+/// Llamado por Windows desde el message loop del thread que instaló el hook.
+unsafe extern "system" fn keyboard_hook_proc(
+    code: i32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, HC_ACTION, KBDLLHOOKSTRUCT,
+        WM_KEYDOWN, WM_SYSKEYDOWN,
+        VK_V, GetKeyState,
+    };
+
+    // Solo procesar si code == HC_ACTION y es key-down
+    if code == HC_ACTION
+        && (wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN)
+    {
+        let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
+
+        // VK_V con Ctrl presionado = Ctrl+V
+        let ctrl_pressed = GetKeyState(0x11 /* VK_CONTROL */) as u16 & 0x8000 != 0;
+
+        if kb.vkCode == VK_V as u32 && ctrl_pressed {
+            // Verificar si tenemos archivos en cola ANTES de que Explorer actúe
+            if let Some(state_arc) = DAEMON_STATE.get() {
+                if let Ok(mut state) = state_arc.try_lock() {
+                    if state.queue.is_some() {
+                        let pending = state.queue.take().unwrap();
+
+                        // Verificar que los paths siguen existiendo (aún no los tocó nadie)
+                        let valid_paths: Vec<std::path::PathBuf> = pending
+                            .paths
+                            .iter()
+                            .filter(|p| p.exists())
+                            .cloned()
+                            .collect();
+
+                        if !valid_paths.is_empty() {
+                            // Resolver destino AHORA (antes de que Explorer consuma el Ctrl+V)
+                            let dest = resolve_dest_static(&state.config);
+
+                            if let Some(dest) = dest {
+                                println!();
+                                println!(
+                                    "  ▶ {} {} elemento(s) → {}",
+                                    pending.operation,
+                                    valid_paths.len(),
+                                    dest.display()
+                                );
+
+                                let runtime = Arc::clone(&state.runtime);
+                                let config  = state.config.clone();
+                                let op      = pending.operation;
+
+                                std::thread::spawn(move || {
+                                    execute_operation(valid_paths, dest, op, &config, &runtime);
+                                });
+
+                                // Consumir el Ctrl+V — no dejar que Explorer lo procese
+                                return 1;
+                            } else {
+                                // No se pudo resolver destino — devolver archivos a la cola
+                                // y dejar que Explorer maneje el Ctrl+V normalmente.
+                                state.queue = Some(PendingItem {
+                                    paths: pending.paths,
+                                    operation: pending.operation,
+                                    sequence: pending.sequence,
+                                });
+                            }
+                        } else {
+                            println!("  ⚠  Los archivos ya no existen en el origen");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let hook = KEYBOARD_HOOK.get().copied().unwrap_or(std::ptr::null_mut());
+    CallNextHookEx(hook, code, wparam, lparam)
+}
+
+/// Versión de `resolve_dest` que no toma `&DaemonState` (para usar desde el hook).
+fn resolve_dest_static(config: &DaemonConfig) -> Option<std::path::PathBuf> {
+    if let Some(ref d) = config.fixed_dest {
+        return Some(d.clone());
+    }
+    if let Some(path) = super::explorer_path::get_active_explorer_path() {
+        return Some(path);
+    }
+    if config.fallback_dialog {
+        println!("  🗂  Selecciona la carpeta de destino...");
+        return super::explorer_path::prompt_folder_dialog("Selecciona dónde pegar — FileCopier");
+    }
+    None
 }
 
 /// WndProc de la ventana message-only.
@@ -270,7 +393,11 @@ unsafe extern "system" fn daemon_wndproc(
         }
         WM_DESTROY => {
             use windows_sys::Win32::System::DataExchange::RemoveClipboardFormatListener;
+            use windows_sys::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
             RemoveClipboardFormatListener(hwnd);
+            if let Some(&hook) = KEYBOARD_HOOK.get() {
+                UnhookWindowsHookEx(hook);
+            }
             PostQuitMessage(0);
             0
         }
@@ -285,7 +412,6 @@ unsafe extern "system" fn daemon_wndproc(
 /// Llamada cada vez que el portapapeles cambia (WM_CLIPBOARDUPDATE).
 fn on_clipboard_update() {
     let has_hdrop = clipboard_has_hdrop();
-    let _seq = get_clipboard_sequence();
 
     let state_arc = match DAEMON_STATE.get() {
         Some(s) => s,
@@ -298,31 +424,11 @@ fn on_clipboard_update() {
     };
 
     if has_hdrop {
-        // El portapapeles tiene archivos. Puede ser:
-        //  1) Ctrl+C/Ctrl+X nuevo (guardar en cola)
-        //  2) Ctrl+V en Explorer (algunas versiones mantienen CF_HDROP y
-        //     solo agregan "Performed DropEffect").
         match read_clipboard_files_and_op() {
             Some(item) => {
-                let performed_effect = unsafe { read_performed_drop_effect_inner() };
-                let is_same_as_pending = state
-                    .queue
-                    .as_ref()
-                    .map(|pending| {
-                        pending.paths == item.paths && pending.operation == item.operation
-                    })
-                    .unwrap_or(false);
-
-                if is_same_as_pending && performed_effect.is_some() {
-                    // Explorer consumió Ctrl+V pero no removió CF_HDROP.
-                    let pending = match state.queue.take() {
-                        Some(p) => p,
-                        None => return,
-                    };
-                    execute_pending_item(&state, pending);
-                    return;
-                }
-
+                // Solo actualizar la cola — NO ejecutar aquí.
+                // La ejecución la dispara el hook de teclado (Ctrl+V),
+                // ANTES de que Explorer tenga oportunidad de actuar.
                 let op = item.operation;
                 let count = item.paths.len();
                 state.queue = Some(item);
@@ -333,85 +439,16 @@ fn on_clipboard_update() {
                 );
             }
             None => {
-                // CF_HDROP pero no se pudo leer — ignorar
                 tracing::debug!("WM_CLIPBOARDUPDATE: CF_HDROP presente pero no legible");
             }
         }
-    } else {
-        // El portapapeles ya NO tiene CF_HDROP.
-        // Si teníamos archivos en cola, significa que se pegaron.
-        let pending = match state.queue.take() {
-            Some(p) => p,
-            None => {
-                // Cola vacía — fue un pegado de texto u otro dato. Ignorar.
-                tracing::trace!("WM_CLIPBOARDUPDATE: sin cola pendiente, ignorando");
-                return;
-            }
-        };
-
-        execute_pending_item(&state, pending);
     }
+    // Ya NO actuamos cuando CF_HDROP desaparece — eso ocurre DESPUÉS
+    // de que Explorer ya copió. El hook de teclado intercepta antes.
 }
 
-fn execute_pending_item(state: &DaemonState, pending: PendingItem) {
-    // Verificar que los paths origen aún existen
-    let valid_paths: Vec<PathBuf> = pending.paths.into_iter().filter(|p| p.exists()).collect();
-
-    if valid_paths.is_empty() {
-        tracing::warn!("WM_CLIPBOARDUPDATE: todos los paths origen desaparecieron");
-        return;
-    }
-
-    // Resolver el directorio destino
-    let dest = resolve_dest(&state.config);
-    let dest = match dest {
-        Some(d) => d,
-        None => {
-            println!("  ⚠  No se pudo determinar la carpeta destino — operación cancelada");
-            return;
-        }
-    };
-
-    println!();
-    println!(
-        "  ▶ {} {} elemento(s) → {}",
-        pending.operation,
-        valid_paths.len(),
-        dest.display()
-    );
-
-    // Lanzar la operación en el runtime compartido
-    let runtime = Arc::clone(&state.runtime);
-    let config = state.config.clone();
-    let op = pending.operation;
-
-    // Spawn en thread OS separado para no bloquear el UI thread
-    let runtime_ref = Arc::clone(&runtime);
-    std::thread::spawn(move || {
-        execute_operation(valid_paths, dest, op, &config, &runtime_ref);
-    });
-}
-
-/// Determina el directorio destino donde pegar.
-fn resolve_dest(config: &DaemonConfig) -> Option<PathBuf> {
-    // 1. Destino fijo configurado
-    if let Some(ref d) = config.fixed_dest {
-        return Some(d.clone());
-    }
-
-    // 2. Carpeta activa en Explorer
-    if let Some(path) = get_active_explorer_path() {
-        return Some(path);
-    }
-
-    // 3. Diálogo de selección (fallback)
-    if config.fallback_dialog {
-        println!("  🗂  Selecciona la carpeta de destino...");
-        return prompt_folder_dialog("Selecciona dónde pegar — FileCopier");
-    }
-
-    None
-}
+// execute_pending_item y resolve_dest eliminados —
+// reemplazados por la lógica en keyboard_hook_proc y resolve_dest_static.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Ejecución de la operación

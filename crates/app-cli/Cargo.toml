@@ -22,6 +22,7 @@ tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
 windows-sys = { version = "0.59", features = [
     "Win32_System_Console",   # SetConsoleCtrlHandler, CTRL_C_EVENT, etc.
     "Win32_Foundation",       # BOOL
+    "Win32_UI_Input_KeyboardAndMouse", # VK_V, GetKeyState
 ] }
 
 # Unix: handler de señales POSIX (SIGINT)
