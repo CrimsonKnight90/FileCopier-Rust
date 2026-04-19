@@ -43,6 +43,7 @@ parking_lot  = { workspace = true }
 
 # Windows API para preallocación nativa
 windows-sys = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tokio    = { workspace = true }

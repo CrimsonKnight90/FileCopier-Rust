@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use walkdir::WalkDir;
 
-use crate::checkpoint::{CheckpointState, FlowControl, ResumePolicy};
+use crate::checkpoint::{CheckpointState, FlowControl};
 use crate::config::{EngineConfig, OperationMode};
 use crate::engine::block::BlockEngine;
 use crate::engine::dry_run::{DryRunReport, DryRunner};
@@ -341,7 +341,7 @@ impl Orchestrator {
         };
 
         let is_move = self.config.operation_mode == OperationMode::Move;
-        let runner  = DryRunner::new(&self.config, is_move, completed);
+        let runner  = DryRunner::new(is_move, completed);
         let report  = runner.run(source_root, dest_root);
 
         Ok(CopyResult {
