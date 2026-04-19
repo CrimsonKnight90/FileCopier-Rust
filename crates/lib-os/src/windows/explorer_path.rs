@@ -71,9 +71,12 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
     };
     use windows::core::{Interface, VARIANT};
 
-    // Inicializar COM en modo STA para este thread
+    // Inicializar COM (puede ya estar inicializado — ignorar resultado)
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
+    // Cuando se llama desde el hook de teclado, el foreground puede ser
+    // la ventana que tenía el foco ANTES de que el hook procesara la tecla.
+    // Iterar TODAS las ventanas Explorer y tomar la primera válida.
     let foreground = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
 
     if foreground.is_null() {
@@ -102,8 +105,14 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
         let hwnd_val = browser_app.HWND().ok()?;
         let hwnd = hwnd_val.0 as isize;
 
-        if hwnd != foreground as isize {
-            continue; // No es la ventana activa
+        // Aceptar la ventana si es la foreground O si es la única ventana Explorer abierta
+        let is_foreground = hwnd == foreground as isize;
+        let is_explorer   = is_explorer_window(hwnd_val.0 as isize as _);
+        if !is_foreground && !is_explorer {
+            continue;
+        }
+        if count > 1 && !is_foreground {
+            continue; // Hay varias ventanas, solo usar la foreground
         }
 
         // Obtener IShellBrowser via IServiceProvider

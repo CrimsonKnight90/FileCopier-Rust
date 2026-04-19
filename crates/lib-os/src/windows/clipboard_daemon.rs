@@ -311,10 +311,11 @@ unsafe extern "system" fn keyboard_hook_proc(
                             .collect();
 
                         if !valid_paths.is_empty() {
-                            // Resolver destino AHORA (antes de que Explorer consuma el Ctrl+V)
-                            let dest = resolve_dest_static(&state.config);
+                            // Intentar resolver destino SIN diálogo (no-blocking)
+                            let dest = resolve_dest_no_dialog(&state.config);
 
                             if let Some(dest) = dest {
+                                // Destino resuelto sincrónicamente — consumir Ctrl+V
                                 println!();
                                 println!(
                                     "  ▶ {} {} elemento(s) → {}",
@@ -331,11 +332,42 @@ unsafe extern "system" fn keyboard_hook_proc(
                                     execute_operation(valid_paths, dest, op, &config, &runtime);
                                 });
 
-                                // Consumir el Ctrl+V — no dejar que Explorer lo procese
-                                return 1;
+                                return 1; // consumir Ctrl+V
+                            } else if state.config.fallback_dialog {
+                                // Sin destino automático: lanzar diálogo en thread
+                                // separado y NO consumir Ctrl+V (Explorer copia normal).
+                                // Cuando el usuario elija carpeta, FileCopier ejecuta.
+                                println!();
+                                println!("  ℹ  No se detectó carpeta activa en Explorer.");
+                                println!("  🗂  Selecciona destino en el diálogo que aparecerá...");
+
+                                let runtime = Arc::clone(&state.runtime);
+                                let config  = state.config.clone();
+                                let op      = pending.operation;
+
+                                std::thread::spawn(move || {
+                                    // El diálogo se muestra FUERA del hook (thread seguro)
+                                    if let Some(dest) = super::explorer_path::prompt_folder_dialog(
+                                        "Selecciona dónde pegar — FileCopier"
+                                    ) {
+                                        println!(
+                                            "  ▶ {} {} elemento(s) → {}",
+                                            op,
+                                            valid_paths.len(),
+                                            dest.display()
+                                        );
+                                        execute_operation(valid_paths, dest, op, &config, &runtime);
+                                    } else {
+                                        println!("  ✗ Operación cancelada por el usuario");
+                                    }
+                                });
+
+                                // Devolver archivos a la cola por si el usuario
+                                // vuelve a hacer Ctrl+V antes de que termine el diálogo.
+                                // NO retornamos 1 — Explorer puede hacer su propia copia.
+                                // (El usuario eligió no tener destino automático.)
                             } else {
-                                // No se pudo resolver destino — devolver archivos a la cola
-                                // y dejar que Explorer maneje el Ctrl+V normalmente.
+                                // Sin destino y sin diálogo → restaurar cola
                                 state.queue = Some(PendingItem {
                                     paths: pending.paths,
                                     operation: pending.operation,
@@ -355,7 +387,15 @@ unsafe extern "system" fn keyboard_hook_proc(
     CallNextHookEx(hook, code, wparam, lparam)
 }
 
-/// Versión de `resolve_dest` que no toma `&DaemonState` (para usar desde el hook).
+/// Resuelve el destino SIN mostrar diálogo bloqueante (seguro desde el hook de teclado).
+fn resolve_dest_no_dialog(config: &DaemonConfig) -> Option<std::path::PathBuf> {
+    if let Some(ref d) = config.fixed_dest {
+        return Some(d.clone());
+    }
+    super::explorer_path::get_active_explorer_path()
+}
+
+/// Versión completa con diálogo (solo llamar desde threads normales, nunca desde el hook).
 fn resolve_dest_static(config: &DaemonConfig) -> Option<std::path::PathBuf> {
     if let Some(ref d) = config.fixed_dest {
         return Some(d.clone());
