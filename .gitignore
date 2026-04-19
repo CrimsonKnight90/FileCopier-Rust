@@ -1,17 +1,16 @@
 ```
-# Build artifacts
-target/
+# Compiled and build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.out
 
 # Dependencies
-**/node_modules/
-**/.venv/
-**/venv/
-**/.env
-**/.env.*
-**/__pycache__/
-**/.mypy_cache/
-**/.pytest_cache/
-**/.gradle/
+target/
+**/target/
 
 # Logs and temp files
 *.log
@@ -22,16 +21,55 @@ target/
 .vscode/
 .idea/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Coverage
+# Coverage reports
 coverage/
 htmlcov/
 .coverage
 
-# Compressed files
+# Environment
+.env
+.env.local
+.env.*
+
+# Python specific
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.Python
+*.egg-info/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.tox/
+
+# Node.js specific
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Rust specific
+Cargo.lock
+**/Cargo.lock
+
+# Build directories
+dist/
+build/
+*.gem
+*.war
+*.jar
+*.class
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# Compression files
 *.zip
 *.gz
 *.tar
@@ -54,4 +92,13 @@ htmlcov/
 *.tar.bz2
 *.tar.xz
 *.tar.zst
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 ```
