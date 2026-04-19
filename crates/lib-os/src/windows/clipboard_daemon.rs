@@ -393,8 +393,9 @@ unsafe extern "system" fn daemon_wndproc(
             use windows_sys::Win32::System::DataExchange::RemoveClipboardFormatListener;
             use windows_sys::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
             RemoveClipboardFormatListener(hwnd);
-            if let Some(&hook) = KEYBOARD_HOOK.get() {
-                UnhookWindowsHookEx(hook);
+            let hook = KEYBOARD_HOOK.load(Ordering::Relaxed);
+            if !hook.is_null() {
+                UnhookWindowsHookEx(hook as _);
             }
             PostQuitMessage(0);
             0
