@@ -71,7 +71,7 @@ fn try_ishellbrowser() -> Option<PathBuf> {
 
 unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
     use windows::Win32::UI::Shell::{
-        IShellBrowser, IShellView, IShellWindows, ShellWindows, SHGetPathFromIDListW,
+        IShellBrowser, IShellView, IShellWindows, ShellWindows,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx,
@@ -164,19 +164,12 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
         // Si es la foreground, usarla inmediatamente
         if is_foreground {
             debug!("IShellBrowser: ventana {} es foreground, procesando...", i);
-            return process_explorer_window::<IShellBrowser, IShellView, IFolderView, IPersistFolder2>(
-                &browser_app, i
-            ).or_else(|| {
-                debug!("IShellBrowser: procesar ventana {} falló", i);
-                None
-            });
+            return process_explorer_window(&browser_app, i);
         }
 
         // Guardar como fallback si es Explorer válido
         if last_valid_path.is_none() {
-            last_valid_path = process_explorer_window::<IShellBrowser, IShellView, IFolderView, IPersistFolder2>(
-                &browser_app, i
-            );
+            last_valid_path = process_explorer_window(&browser_app, i);
             if last_valid_path.is_some() {
                 debug!("IShellBrowser: guardado path de ventana {} como fallback", i);
             }
@@ -194,12 +187,14 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
 }
 
 /// Procesa una ventana Explorer específica para obtener su path
+/// Usa un enfoque simplificado que evita IFolderView/IPersistFolder2
 fn process_explorer_window(
     browser_app: &windows::Win32::UI::Shell::IWebBrowserApp,
     index: i32,
 ) -> Option<PathBuf> {
     use windows::Win32::System::Com::IServiceProvider;
-    use windows::Win32::UI::Shell::{IFolderView, IPersistFolder2, IShellBrowser, IShellView};
+    use windows::Win32::UI::Shell::{IShellBrowser, IShellView, SHGetPathFromIDListW};
+    use windows::core::Interface;
 
     let service_provider: IServiceProvider = browser_app.cast().ok()?;
     let shell_browser: IShellBrowser = service_provider
@@ -207,10 +202,16 @@ fn process_explorer_window(
         .ok()?;
 
     let shell_view: IShellView = shell_browser.QueryActiveShellView().ok()?;
-    let folder_view: IFolderView = shell_view.cast().ok()?;
     
-    let folder_unknown = folder_view.GetFolder::<windows::core::IUnknown>().ok()?;
-    let persist: IPersistFolder2 = folder_unknown.cast().ok()?;
+    // Obtener el PIDL usando IShellView::GetItemObject
+    // Esto es más compatible que IFolderView
+    use windows::Win32::UI::Shell::SGIO_OPENITEM;
+    let pidl_result = shell_view.GetItemObject(SGIO_OPENITEM);
+    let pidl = pidl_result.ok()?;
+    
+    // Convertir a IPersistFolder para obtener el path
+    use windows::Win32::System::Com::IPersist;
+    let persist: windows::Win32::UI::Shell::IPersistFolder = shell_view.cast().ok()?;
     let pidl = persist.GetCurFolder().ok()?;
 
     let mut buf = [0u16; 32768];

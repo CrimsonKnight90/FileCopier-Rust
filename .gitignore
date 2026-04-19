@@ -1,13 +1,21 @@
 ```
-# Build artifacts
+# Rust/Cargo specific
 target/
+Cargo.lock
+*.rs.bk
+*.tmp
 
 # Dependencies
-Cargo.lock
+**/node_modules/
+**/.venv/
+**/venv/
 
-# Logs and temp files
+# Build artifacts
+**/dist/
+**/build/
+
+# Logs
 *.log
-*.tmp
 
 # Environment
 .env
@@ -29,6 +37,11 @@ coverage/
 htmlcov/
 .coverage
 
-# Rust-specific
-**/*.rs.bk
+# Python cache (if any Python files exist in the workspace)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+.pytest_cache/
 ```

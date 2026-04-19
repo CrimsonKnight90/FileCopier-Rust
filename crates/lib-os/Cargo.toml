@@ -27,6 +27,10 @@ windows = { version = "0.58", features = [
     "Win32_System_Ole",
     # WindowsAndMessaging (GetForegroundWindow, etc.)
     "Win32_UI_WindowsAndMessaging",
+    # WinRT para IShellBrowser interfaces
+    "Win32_System_Threading",
+    # Interfaces adicionales para IFolderView e IPersistFolder2
+    "Win32_System_Com_StructuredStorage",
 ] }
 
 # Crate `windows-sys` para APIs procedurales (más ligero para WndProc, mensajes, etc.)
