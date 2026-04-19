@@ -129,7 +129,6 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
             }
         };
 
-        use windows::Win32::System::Com::IServiceProvider;
         use windows::Win32::UI::Shell::IWebBrowserApp;
 
         let browser_app: IWebBrowserApp = match item.cast() {
@@ -187,35 +186,34 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
 }
 
 /// Procesa una ventana Explorer específica para obtener su path
-/// Usa un enfoque simplificado que evita IFolderView/IPersistFolder2
 fn process_explorer_window(
     browser_app: &windows::Win32::UI::Shell::IWebBrowserApp,
     index: i32,
 ) -> Option<PathBuf> {
-    use windows::Win32::System::Com::IServiceProvider;
     use windows::Win32::UI::Shell::{IShellBrowser, IShellView};
     use windows::core::Interface;
 
-    let service_provider: IServiceProvider = browser_app.cast().ok()?;
-    let shell_browser: IShellBrowser = service_provider
-        .QueryService(&windows::Win32::UI::Shell::SID_STopLevelBrowser)
-        .ok()?;
+    let service_provider: windows::Win32::System::Com::IServiceProvider = browser_app.cast().ok()?;
+    let shell_browser: IShellBrowser = unsafe {
+        service_provider
+            .QueryService(&windows::Win32::UI::Shell::SID_STopLevelBrowser)
+    }.ok()?;
 
-    let shell_view: IShellView = shell_browser.QueryActiveShellView().ok()?;
+    let shell_view: IShellView = unsafe { shell_browser.QueryActiveShellView() }.ok()?;
     
     // Obtener el folder actual usando GetFolder::<IUnknown> y luego cast a IPersistFolder
     use windows::Win32::UI::Shell::IFolderView;
     let folder_view: IFolderView = shell_view.cast().ok()?;
     
-    let folder_unknown = folder_view.GetFolder::<windows::core::IUnknown>().ok()?;
+    let folder_unknown = unsafe { folder_view.GetFolder::<windows::core::IUnknown>() }.ok()?;
     let persist: windows::Win32::UI::Shell::IPersistFolder2 = folder_unknown.cast().ok()?;
     
-    let pidl = persist.GetCurFolder().ok()?;
+    let pidl = unsafe { persist.GetCurFolder() }.ok()?;
     
     // Convertir PIDL a path usando SHGetPathFromIDListW
     use windows::Win32::UI::Shell::SHGetPathFromIDListW;
     let mut buf = [0u16; 260];
-    if SHGetPathFromIDListW(pidl, &mut buf).as_bool() {
+    if unsafe { SHGetPathFromIDListW(pidl, &mut buf) }.as_bool() {
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         let s = String::from_utf16_lossy(&buf[..len]);
         debug!("IShellBrowser: path obtenido de ventana {} = '{}'", index, s);
