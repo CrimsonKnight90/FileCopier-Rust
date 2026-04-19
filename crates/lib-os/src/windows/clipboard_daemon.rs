@@ -30,17 +30,44 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! ## Detección del pegado
+//! ## Detección del pegado — ARQUITECTURA CORREGIDA (v2)
 //!
-//! Cuando el usuario hace Ctrl+V en Explorer:
-//! 1. Explorer lee `CF_HDROP` del portapapeles.
-//! 2. Explorer copia los archivos.
-//! 3. Explorer llama a `EmptyClipboard()` o reemplaza el contenido.
-//! 4. Se dispara `WM_CLIPBOARDUPDATE` en todos los listeners.
+//! ### Problema original (v1)
+//! El hook de teclado intentaba resolver el destino via COM (IShellBrowser)
+//! DURANTE el hook WH_KEYBOARD_LL, lo cual causaba el error:
+//! `0x8001010D: An outgoing call cannot be made since the application is
+//! dispatching an input-synchronous call.`
 //!
-//! En ese momento, `IsClipboardFormatAvailable(CF_HDROP)` retorna FALSE
-//! (o retorna TRUE con datos distintos a los que teníamos en la cola).
-//! Eso nos indica que ocurrió un paste y debemos ejecutar la operación.
+//! ### Solución (v2) — Separación de responsabilidades
+//!
+//! **Hook de teclado (WH_KEYBOARD_LL):**
+//! - Solo detecta Ctrl+V y verifica si hay cola pendiente.
+//! - Si NO hay destino automático, NO consume el evento (retorna CallNextHookEx).
+//! - Deja que Explorer procese Ctrl+V normalmente.
+//!
+//! **Message loop (WM_CLIPBOARDUPDATE):**
+//! - Cuando CF_HDROP desaparece (después del paste), se dispara este mensaje.
+//! - Aquí SÍ resolvemos el destino via COM (thread seguro para STA).
+//! - Mostramos diálogo si es necesario y ejecutamos FileCopier.
+//!
+//! ### Flujo completo
+//!
+//! ```text
+//! 1. Usuario: Ctrl+C en Explorer
+//!    → WM_CLIPBOARDUPDATE (CF_HDROP presente)
+//!    → guardar en cola: "📋 COPIAR 1 archivo(s) en cola"
+//!
+//! 2. Usuario: va a carpeta destino, presiona Ctrl+V
+//!    → Hook de teclado detecta Ctrl+V
+//!       ├─ Hay destino automático? → consumir evento, ejecutar ahora
+//!       └─ No hay destino? → NO consumir, dejar pasar a Explorer
+//!
+//! 3. Explorer: procesa Ctrl+V, pega archivos, limpia portapapeles
+//!    → WM_CLIPBOARDUPDATE (CF_HDROP ausente)
+//!       ├─ Resolver destino via COM (IShellBrowser / UIAutomation)
+//!       ├─ Si no hay destino → mostrar diálogo (thread seguro)
+//!       └─ Ejecutar FileCopier en thread separado
+//! ```
 //!
 //! ## Resolución del destino
 //!
@@ -334,38 +361,21 @@ unsafe extern "system" fn keyboard_hook_proc(
 
                                 return 1; // consumir Ctrl+V
                             } else if state.config.fallback_dialog {
-                                // Sin destino automático: lanzar diálogo en thread
-                                // separado y NO consumir Ctrl+V (Explorer copia normal).
-                                // Cuando el usuario elija carpeta, FileCopier ejecuta.
-                                println!();
-                                println!("  ℹ  No se detectó carpeta activa en Explorer.");
-                                println!("  🗂  Selecciona destino en el diálogo que aparecerá...");
-
-                                let runtime = Arc::clone(&state.runtime);
-                                let config  = state.config.clone();
-                                let op      = pending.operation;
-
-                                std::thread::spawn(move || {
-                                    // El diálogo se muestra FUERA del hook (thread seguro)
-                                    if let Some(dest) = super::explorer_path::prompt_folder_dialog(
-                                        "Selecciona dónde pegar — FileCopier"
-                                    ) {
-                                        println!(
-                                            "  ▶ {} {} elemento(s) → {}",
-                                            op,
-                                            valid_paths.len(),
-                                            dest.display()
-                                        );
-                                        execute_operation(valid_paths, dest, op, &config, &runtime);
-                                    } else {
-                                        println!("  ✗ Operación cancelada por el usuario");
-                                    }
+                                // Sin destino automático: NO consumir Ctrl+V ahora.
+                                // En su lugar, marcar la cola para que WM_CLIPBOARDUPDATE
+                                // detecte el paste DESPUÉS y lance el diálogo.
+                                // Esto evita el error COM 0x8001010D del hook.
+                                state.queue = Some(PendingItem {
+                                    paths: valid_paths,
+                                    operation: pending.operation,
+                                    sequence: pending.sequence,
                                 });
-
-                                // Devolver archivos a la cola por si el usuario
-                                // vuelve a hacer Ctrl+V antes de que termine el diálogo.
-                                // NO retornamos 1 — Explorer puede hacer su propia copia.
-                                // (El usuario eligió no tener destino automático.)
+                                
+                                println!();
+                                println!("  ℹ  Pegando en Explorer... (FileCopier detectará el destino)");
+                                
+                                // NO retornar 1 — dejar que Explorer procese Ctrl+V normalmente.
+                                // WM_CLIPBOARDUPDATE se disparará después del paste.
                             } else {
                                 // Sin destino y sin diálogo → restaurar cola
                                 state.queue = Some(PendingItem {
@@ -393,6 +403,30 @@ fn resolve_dest_no_dialog(config: &DaemonConfig) -> Option<std::path::PathBuf> {
         return Some(d.clone());
     }
     super::explorer_path::get_active_explorer_path()
+}
+
+/// Resuelve el destino inicializando COM en STA en el thread actual.
+/// Debe llamarse SIEMPRE desde un thread que no sea el hook WH_KEYBOARD_LL.
+/// Esta función garantiza que COM esté inicializado correctamente para llamadas
+/// a IShellBrowser / ShellWindows.
+fn resolve_dest_with_com(config: &DaemonConfig) -> Option<std::path::PathBuf> {
+    if let Some(ref d) = config.fixed_dest {
+        return Some(d.clone());
+    }
+    unsafe {
+        use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+        // Inicializar COM en STA (Single-Threaded Apartment)
+        // Esto es requerido por IShellBrowser y ShellWindows
+        let hr = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let result = if hr >= 0 || hr == 0x00000001 { // S_OK o S_FALSE (ya inicializado)
+            super::explorer_path::get_active_explorer_path()
+        } else {
+            tracing::warn!("CoInitializeEx falló: {:?}", hr);
+            None
+        };
+        CoUninitialize();
+        result
+    }
 }
 
 /// Versión completa con diálogo (solo llamar desde threads normales, nunca desde el hook).
@@ -481,9 +515,62 @@ fn on_clipboard_update() {
                 tracing::debug!("WM_CLIPBOARDUPDATE: CF_HDROP presente pero no legible");
             }
         }
+    } else {
+        // CF_HDROP YA NO está disponible → el usuario pegó (o otra app limpió el portapapeles).
+        // Si tenemos cola pendiente, intentar resolver destino AHORA (desde message loop, thread seguro para COM).
+        if let Some(pending) = state.queue.take() {
+            let dest = resolve_dest_static(&state.config);
+            
+            if let Some(dest) = dest {
+                println!();
+                println!(
+                    "  ▶ {} {} elemento(s) → {}",
+                    pending.operation,
+                    pending.paths.len(),
+                    dest.display()
+                );
+
+                let runtime = Arc::clone(&state.runtime);
+                let config  = state.config.clone();
+                let op      = pending.operation;
+                let valid_paths: Vec<PathBuf> = pending.paths.into_iter().filter(|p| p.exists()).collect();
+
+                std::thread::spawn(move || {
+                    execute_operation(valid_paths, dest, op, &config, &runtime);
+                });
+            } else if state.config.fallback_dialog {
+                // Mostrar diálogo desde el message loop (thread seguro para COM STA)
+                println!();
+                println!("  ℹ  No se detectó carpeta activa en Explorer.");
+                println!("  🗂  Selecciona destino en el diálogo que aparecerá...");
+
+                let runtime = Arc::clone(&state.runtime);
+                let config  = state.config.clone();
+                let op      = pending.operation;
+                let valid_paths: Vec<PathBuf> = pending.paths.into_iter().filter(|p| p.exists()).collect();
+
+                std::thread::spawn(move || {
+                    if let Some(dest) = super::explorer_path::prompt_folder_dialog(
+                        "Selecciona dónde pegar — FileCopier"
+                    ) {
+                        println!(
+                            "  ▶ {} {} elemento(s) → {}",
+                            op,
+                            valid_paths.len(),
+                            dest.display()
+                        );
+                        execute_operation(valid_paths, dest, op, &config, &runtime);
+                    } else {
+                        println!("  ✗ Operación cancelada por el usuario");
+                    }
+                });
+            } else {
+                // Sin destino y sin diálogo → restaurar cola
+                state.queue = Some(pending);
+                tracing::debug!("WM_CLIPBOARDUPDATE: no hay destino disponible, cola restaurada");
+            }
+        }
     }
-    // Ya NO actuamos cuando CF_HDROP desaparece — eso ocurre DESPUÉS
-    // de que Explorer ya copió. El hook de teclado intercepta antes.
 }
 
 // execute_pending_item y resolve_dest eliminados —
