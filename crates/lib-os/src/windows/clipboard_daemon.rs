@@ -58,11 +58,11 @@
 //! la respuesta es inmediata y el CPU en idle es 0%.
 
 use std::path::PathBuf;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
-
-use super::explorer_path::{get_active_explorer_path, prompt_folder_dialog};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tipos públicos
@@ -134,9 +134,7 @@ struct DaemonState {
 static DAEMON_STATE: std::sync::OnceLock<Arc<Mutex<DaemonState>>> = std::sync::OnceLock::new();
 
 // Handle del hook de teclado global — guardado para poder desinstalarlo.
-static KEYBOARD_HOOK: std::sync::OnceLock
-    windows_sys::Win32::UI::WindowsAndMessaging::HHOOK,
-> = std::sync::OnceLock::new();
+static KEYBOARD_HOOK: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Daemon principal
@@ -153,7 +151,7 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
     use windows_sys::Win32::System::DataExchange::AddClipboardFormatListener;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DispatchMessageW, GetMessageW, PostQuitMessage, RegisterClassExW,
+        CreateWindowExW, DispatchMessageW, GetMessageW, RegisterClassExW,
         TranslateMessage, HWND_MESSAGE, MSG, WNDCLASSEXW,
     };
 
@@ -251,7 +249,7 @@ unsafe fn run_daemon_impl(config: DaemonConfig) -> Result<()> {
             std::io::Error::last_os_error()
         );
     }
-    KEYBOARD_HOOK.set(hook).ok();
+    KEYBOARD_HOOK.store(hook, Ordering::Relaxed);
 
     tracing::info!("Daemon iniciado — hook de teclado activo, esperando Ctrl+V...");
 
@@ -284,18 +282,18 @@ unsafe extern "system" fn keyboard_hook_proc(
 ) -> windows_sys::Win32::Foundation::LRESULT {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, HC_ACTION, KBDLLHOOKSTRUCT,
-        WM_KEYDOWN, WM_SYSKEYDOWN,
-        VK_V, GetKeyState,
+        WM_KEYDOWN, WM_SYSKEYDOWN,        
     };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_V};
 
     // Solo procesar si code == HC_ACTION y es key-down
-    if code == HC_ACTION
+    if code == HC_ACTION as i32
         && (wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN)
     {
         let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
 
         // VK_V con Ctrl presionado = Ctrl+V
-        let ctrl_pressed = GetKeyState(0x11 /* VK_CONTROL */) as u16 & 0x8000 != 0;
+        let ctrl_pressed = GetKeyState(VK_CONTROL as i32) as u16 & 0x8000 != 0;
 
         if kb.vkCode == VK_V as u32 && ctrl_pressed {
             // Verificar si tenemos archivos en cola ANTES de que Explorer actúe
@@ -353,7 +351,7 @@ unsafe extern "system" fn keyboard_hook_proc(
         }
     }
 
-    let hook = KEYBOARD_HOOK.get().copied().unwrap_or(std::ptr::null_mut());
+    let hook = KEYBOARD_HOOK.load(Ordering::Relaxed);
     CallNextHookEx(hook, code, wparam, lparam)
 }
 
