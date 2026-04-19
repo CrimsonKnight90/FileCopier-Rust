@@ -23,8 +23,16 @@
 //! Explorer no expone el path actual directamente. La forma oficial es via COM
 //! (IShellBrowser), pero requiere que el thread esté en un apartamento COM STA.
 //! Por eso `get_active_explorer_path()` inicializa COM si es necesario.
+//!
+//! ## Nota sobre hooks de teclado
+//!
+//! Cuando se llama desde un hook WH_KEYBOARD_LL, `GetForegroundWindow()` puede
+//! retornar un valor incorrecto porque el hook se ejecuta ANTES de que el
+//! sistema actualice el foco. Por eso iteramos TODAS las ventanas Explorer
+//! y usamos la más reciente como fallback.
 
 use std::path::PathBuf;
+use tracing::{debug, warn, info};
 
 /// Intenta obtener la ruta de la carpeta activa en el Explorer foreground.
 ///
@@ -33,23 +41,23 @@ use std::path::PathBuf;
 pub fn get_active_explorer_path() -> Option<PathBuf> {
     // Estrategia 1: IShellBrowser via COM (más confiable)
     if let Some(path) = try_ishellbrowser() {
-        tracing::debug!("ExplorerPath: obtenido via IShellBrowser — {}", path.display());
+        debug!("ExplorerPath: obtenido via IShellBrowser — {}", path.display());
         return Some(path);
     }
 
     // Estrategia 2: UI Automation (AddressBar)
     if let Some(path) = try_ui_automation() {
-        tracing::debug!("ExplorerPath: obtenido via UIAutomation — {}", path.display());
+        debug!("ExplorerPath: obtenido via UIAutomation — {}", path.display());
         return Some(path);
     }
 
     // Estrategia 3: Leer la barra de título de la ventana Explorer
     if let Some(path) = try_window_title() {
-        tracing::debug!("ExplorerPath: obtenido via window title — {}", path.display());
+        debug!("ExplorerPath: obtenido via window title — {}", path.display());
         return Some(path);
     }
 
-    tracing::warn!("ExplorerPath: no se pudo determinar la carpeta activa");
+    warn!("ExplorerPath: no se pudo determinar la carpeta activa");
     None
 }
 
@@ -72,77 +80,149 @@ unsafe fn try_ishellbrowser_impl() -> Option<PathBuf> {
     use windows::core::{Interface, VARIANT};
 
     // Inicializar COM (puede ya estar inicializado — ignorar resultado)
-    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let com_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    debug!("IShellBrowser: CoInitializeEx hr={:?}", com_hr);
 
-    // Cuando se llama desde el hook de teclado, el foreground puede ser
-    // la ventana que tenía el foco ANTES de que el hook procesara la tecla.
-    // Iterar TODAS las ventanas Explorer y tomar la primera válida.
     let foreground = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+    debug!("IShellBrowser: foreground HWND={:?}", foreground);
 
     if foreground.is_null() {
+        warn!("IShellBrowser: foreground HWND es null");
         return None;
     }
 
     // Crear instancia de ShellWindows (colección de ventanas Explorer)
-    let shell_windows: IShellWindows = CoCreateInstance(
+    let shell_windows_result: windows::core::Result<IShellWindows> = CoCreateInstance(
         &ShellWindows,
         None,
         CLSCTX_LOCAL_SERVER,
-    ).ok()?;
+    );
 
-    let count = shell_windows.Count().ok()?;
+    let shell_windows = match shell_windows_result {
+        Ok(sw) => sw,
+        Err(e) => {
+            warn!("IShellBrowser: CoCreateInstance(ShellWindows) falló: {:?}", e);
+            return None;
+        }
+    };
+
+    let count = match shell_windows.Count() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("IShellBrowser: ShellWindows.Count() falló: {:?}", e);
+            return None;
+        }
+    };
+
+    debug!("IShellBrowser: {} ventanas Shell encontradas", count);
+
+    // Iterar TODAS las ventanas Explorer y tomar la que coincida con foreground
+    // o la última válida si hay múltiples (fallback para hook de teclado)
+    let mut last_valid_path: Option<PathBuf> = None;
 
     for i in 0..count {
-        let item = shell_windows.Item(&VARIANT::from(i as i32)).ok()?;
+        let item = match shell_windows.Item(&VARIANT::from(i as i32)) {
+            Ok(it) => it,
+            Err(e) => {
+                debug!("IShellBrowser: Item({}) falló: {:?}", i, e);
+                continue;
+            }
+        };
 
-        // Obtener IDispatch → IWebBrowserApp → IServiceProvider → IShellBrowser
         use windows::Win32::System::Com::IServiceProvider;
         use windows::Win32::UI::Shell::IWebBrowserApp;
 
-        let browser_app: IWebBrowserApp = item.cast().ok()?;
-
-        // Obtener HWND de esta ventana Explorer
-        let hwnd_val = browser_app.HWND().ok()?;
-        let hwnd = hwnd_val.0 as isize;
-
-        // Aceptar la ventana si es la foreground O si es la única ventana Explorer abierta
-        let is_foreground = hwnd == foreground as isize;
-        let is_explorer   = is_explorer_window(hwnd_val.0 as isize as _);
-        if !is_foreground && !is_explorer {
-            continue;
-        }
-        if count > 1 && !is_foreground {
-            continue; // Hay varias ventanas, solo usar la foreground
-        }
-
-        // Obtener IShellBrowser via IServiceProvider
-        let service_provider: IServiceProvider = browser_app.cast().ok()?;
-        let shell_browser: IShellBrowser = service_provider
-            .QueryService(&windows::Win32::UI::Shell::SID_STopLevelBrowser)
-            .ok()?;
-
-        // Obtener la vista activa
-        let shell_view: IShellView = shell_browser.QueryActiveShellView().ok()?;
-
-        // Obtener el PIDL de la carpeta actual
-        use windows::Win32::UI::Shell::{IFolderView, IPersistFolder2};
-        let folder_view: IFolderView = shell_view.cast().ok()?;
-        let persist: IPersistFolder2 = {
-            let folder = folder_view.GetFolder::<windows::core::IUnknown>().ok()?;
-            folder.cast().ok()?
+        let browser_app: IWebBrowserApp = match item.cast() {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("IShellBrowser: cast IWebBrowserApp({}) falló: {:?}", i, e);
+                continue;
+            }
         };
 
-        let pidl = persist.GetCurFolder().ok()?;
+        let hwnd_val = match browser_app.HWND() {
+            Ok(h) => h,
+            Err(e) => {
+                debug!("IShellBrowser: HWND({}) falló: {:?}", i, e);
+                continue;
+            }
+        };
 
-        // Convertir PIDL a path
-        let mut buf = [0u16; 260];
-        if SHGetPathFromIDListW(pidl, &mut buf).as_bool() {
-            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            let s = String::from_utf16_lossy(&buf[..len]);
-            if !s.is_empty() {
-                return Some(PathBuf::from(s));
+        let hwnd = hwnd_val.0 as isize;
+        let is_foreground = hwnd == foreground as isize;
+        let is_explorer = is_explorer_window(hwnd_val.0 as isize as _);
+        
+        debug!(
+            "IShellBrowser: ventana {} hwnd={} foreground={} is_foreground={} is_explorer={}",
+            i, hwnd, foreground as isize, is_foreground, is_explorer
+        );
+
+        if !is_explorer {
+            continue;
+        }
+
+        // Si es la foreground, usarla inmediatamente
+        if is_foreground {
+            debug!("IShellBrowser: ventana {} es foreground, procesando...", i);
+            return process_explorer_window::<IShellBrowser, IShellView, IFolderView, IPersistFolder2>(
+                &browser_app, i
+            ).or_else(|| {
+                debug!("IShellBrowser: procesar ventana {} falló", i);
+                None
+            });
+        }
+
+        // Guardar como fallback si es Explorer válido
+        if last_valid_path.is_none() {
+            last_valid_path = process_explorer_window::<IShellBrowser, IShellView, IFolderView, IPersistFolder2>(
+                &browser_app, i
+            );
+            if last_valid_path.is_some() {
+                debug!("IShellBrowser: guardado path de ventana {} como fallback", i);
             }
         }
+    }
+
+    // Si no encontramos la foreground pero tenemos al menos una ventana Explorer
+    if let Some(path) = last_valid_path {
+        info!("IShellBrowser: usando ventana Explorer no-foreground como fallback");
+        return Some(path);
+    }
+
+    warn!("IShellBrowser: ninguna ventana Explorer válida encontrada");
+    None
+}
+
+/// Procesa una ventana Explorer específica para obtener su path
+fn process_explorer_window(
+    browser_app: &windows::Win32::UI::Shell::IWebBrowserApp,
+    index: i32,
+) -> Option<PathBuf> {
+    use windows::Win32::System::Com::IServiceProvider;
+    use windows::Win32::UI::Shell::{IFolderView, IPersistFolder2, IShellBrowser, IShellView};
+
+    let service_provider: IServiceProvider = browser_app.cast().ok()?;
+    let shell_browser: IShellBrowser = service_provider
+        .QueryService(&windows::Win32::UI::Shell::SID_STopLevelBrowser)
+        .ok()?;
+
+    let shell_view: IShellView = shell_browser.QueryActiveShellView().ok()?;
+    let folder_view: IFolderView = shell_view.cast().ok()?;
+    
+    let folder_unknown = folder_view.GetFolder::<windows::core::IUnknown>().ok()?;
+    let persist: IPersistFolder2 = folder_unknown.cast().ok()?;
+    let pidl = persist.GetCurFolder().ok()?;
+
+    let mut buf = [0u16; 32768];
+    if SHGetPathFromIDListW(pidl, &mut buf).as_bool() {
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let s = String::from_utf16_lossy(&buf[..len]);
+        debug!("IShellBrowser: path obtenido de ventana {} = '{}'", index, s);
+        if !s.is_empty() {
+            return Some(PathBuf::from(s));
+        }
+    } else {
+        debug!("IShellBrowser: SHGetPathFromIDListW({}) falló", index);
     }
 
     None
