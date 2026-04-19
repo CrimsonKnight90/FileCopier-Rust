@@ -27,7 +27,6 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
-use crate::config::EngineConfig;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tipos públicos
@@ -189,20 +188,18 @@ impl DryRunReport {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Ejecuta el análisis dry-run.
-pub struct DryRunner<'a> {
-    config:    &'a EngineConfig,
+pub struct DryRunner {
     is_move:   bool,
     /// Paths relativos ya completados (del checkpoint).
     completed: std::collections::HashSet<PathBuf>,
 }
 
-impl<'a> DryRunner<'a> {
+impl DryRunner {
     pub fn new(
-        config:    &'a EngineConfig,
         is_move:   bool,
         completed: std::collections::HashSet<PathBuf>,
     ) -> Self {
-        Self { config, is_move, completed }
+        Self { is_move, completed }
     }
 
     /// Ejecuta el análisis y produce el informe.

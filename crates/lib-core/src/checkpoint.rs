@@ -455,7 +455,8 @@ impl CheckpointState {
             completed:      HashMap<PathBuf, Option<String>>,
             failed:         HashMap<PathBuf, String>,
             pending:        HashSet<PathBuf>,
-            format_version: u32,
+            #[serde(rename = "format_version")]
+            _format_version: u32,
         }
 
         let v1: CheckpointV1 = serde_json::from_str(&json).map_err(|e| {
