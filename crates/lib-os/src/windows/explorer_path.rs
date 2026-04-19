@@ -193,7 +193,7 @@ fn process_explorer_window(
     index: i32,
 ) -> Option<PathBuf> {
     use windows::Win32::System::Com::IServiceProvider;
-    use windows::Win32::UI::Shell::{IShellBrowser, IShellView, SHGetPathFromIDListW};
+    use windows::Win32::UI::Shell::{IShellBrowser, IShellView};
     use windows::core::Interface;
 
     let service_provider: IServiceProvider = browser_app.cast().ok()?;
@@ -203,18 +203,18 @@ fn process_explorer_window(
 
     let shell_view: IShellView = shell_browser.QueryActiveShellView().ok()?;
     
-    // Obtener el PIDL usando IShellView::GetItemObject
-    // Esto es más compatible que IFolderView
-    use windows::Win32::UI::Shell::SGIO_OPENITEM;
-    let pidl_result = shell_view.GetItemObject(SGIO_OPENITEM);
-    let pidl = pidl_result.ok()?;
+    // Obtener el folder actual usando GetFolder::<IUnknown> y luego cast a IPersistFolder
+    use windows::Win32::UI::Shell::IFolderView;
+    let folder_view: IFolderView = shell_view.cast().ok()?;
     
-    // Convertir a IPersistFolder para obtener el path
-    use windows::Win32::System::Com::IPersist;
-    let persist: windows::Win32::UI::Shell::IPersistFolder = shell_view.cast().ok()?;
+    let folder_unknown = folder_view.GetFolder::<windows::core::IUnknown>().ok()?;
+    let persist: windows::Win32::UI::Shell::IPersistFolder2 = folder_unknown.cast().ok()?;
+    
     let pidl = persist.GetCurFolder().ok()?;
-
-    let mut buf = [0u16; 32768];
+    
+    // Convertir PIDL a path usando SHGetPathFromIDListW
+    use windows::Win32::UI::Shell::SHGetPathFromIDListW;
+    let mut buf = [0u16; 260];
     if SHGetPathFromIDListW(pidl, &mut buf).as_bool() {
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         let s = String::from_utf16_lossy(&buf[..len]);
