@@ -398,11 +398,12 @@ unsafe extern "system" fn keyboard_hook_proc(
 }
 
 /// Resuelve el destino SIN mostrar diálogo bloqueante (seguro desde el hook de teclado).
+/// Esta función SOLO verifica configuración fija — NO hace llamadas COM.
+/// Las llamadas COM deben hacerse via resolve_dest_with_com() desde un thread separado.
 fn resolve_dest_no_dialog(config: &DaemonConfig) -> Option<std::path::PathBuf> {
-    if let Some(ref d) = config.fixed_dest {
-        return Some(d.clone());
-    }
-    super::explorer_path::get_active_explorer_path()
+    // Solo retornar destino fijo si está configurado
+    // NO llamar a get_active_explorer_path() aquí porque hace COM desde el hook
+    config.fixed_dest.clone()
 }
 
 /// Resuelve el destino inicializando COM en STA en el thread actual.
@@ -430,11 +431,13 @@ fn resolve_dest_with_com(config: &DaemonConfig) -> Option<std::path::PathBuf> {
 }
 
 /// Versión completa con diálogo (solo llamar desde threads normales, nunca desde el hook).
+/// Esta función usa resolve_dest_with_com() para garantizar inicialización correcta de COM.
 fn resolve_dest_static(config: &DaemonConfig) -> Option<std::path::PathBuf> {
     if let Some(ref d) = config.fixed_dest {
         return Some(d.clone());
     }
-    if let Some(path) = super::explorer_path::get_active_explorer_path() {
+    // Usar resolve_dest_with_com que inicializa COM correctamente en STA
+    if let Some(path) = resolve_dest_with_com(config) {
         return Some(path);
     }
     if config.fallback_dialog {
