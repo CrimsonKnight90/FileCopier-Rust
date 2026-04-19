@@ -1,35 +1,35 @@
---- .gitignore
-# Dependencies
-target/
-**/target/
-
-# Compiled files
-*.dll
-*.so
-*.dylib
-*.exe
+# Compiled and build artifacts
+*.pyc
+__pycache__/
 *.o
 *.obj
+*.exe
+*.dll
+*.so
 *.a
-*.lib
+*.out
+dist/
+build/
+target/
 
-# Rust-specific
-Cargo.lock
-**/Cargo.lock
-**/*.rs.bk
-**/.*.rs.swp
+# Dependencies
+.venv/
+venv/
+node_modules/
+.mypy_cache/
+.pytest_cache/
+.gradle/
 
-# Logs
+# Logs and temp files
 *.log
-
-# Temporary files
 *.tmp
-*.temp
+*.swp
+*.swo
 
 # Environment
 .env
 .env.local
-.env.*
+*.env.*
 
 # Editors
 .vscode/
@@ -37,31 +37,22 @@ Cargo.lock
 *.swp
 *.swo
 
+# System files
+.DS_Store
+Thumbs.db
+
 # Coverage
 coverage/
 htmlcov/
 .coverage
 
-# OS
-.DS_Store
-Thumbs.db
+# Rust specific
+Cargo.lock
+*.rs.bk
+doc/
+target/
 
-# MyPy
-.mypy_cache/
-
-# PyTest
-.pytest_cache/
-
-# Gradle
-.gradle/
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Compressed files
+# Compression files
 *.zip
 *.gz
 *.tar
@@ -80,42 +71,3 @@ __pycache__/
 *.Z
 *.lz
 *.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
-
-+++ .gitignore (修改后)
-```
-# Dependencies
-target/
-Cargo.lock
-
-# Compiled and build artifacts
-**/*.rs.bk
-**/*.rlib
-**/*.so
-**/*.dylib
-**/*.dll
-**/*.exe
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# Editors
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS generated files
-.DS_Store
-Thumbs.db
-```
